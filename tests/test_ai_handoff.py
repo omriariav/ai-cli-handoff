@@ -640,14 +640,30 @@ class AiHandoffTests(unittest.TestCase):
         manifest = self.module.build_manifest(str(self.project), last=1)
         manifest["selected_global_action_ids"] = ["plugin:demo@demo-market"]
 
-        results = self.module.apply_selected_global_actions(manifest)
+        with mock.patch.object(
+            self.module,
+            "install_bridged_plugin",
+            return_value={
+                "selector": "cc-demo@cc-bridged-plugins",
+                "command": "codex plugin add cc-demo@cc-bridged-plugins",
+                "returncode": 0,
+                "stdout": "",
+                "stderr": "",
+                "installed": True,
+                "reason": "",
+            },
+        ) as install:
+            results = self.module.apply_selected_global_actions(manifest)
 
         self.assertEqual(results[0]["status"], "ok")
+        install.assert_called_once_with("cc-demo")
+        self.assertTrue(results[0]["install"]["installed"])
         bridge_dir = self.home / ".codex" / "plugins" / "cc-demo"
         manifest_path = bridge_dir / ".codex-plugin" / "plugin.json"
         agent_path = self.home / ".codex" / "agents" / "cc_demo_helper.toml"
         registry_path = self.home / ".agents" / "plugins" / "marketplace.json"
         self.assertTrue((bridge_dir / "skills" / "greet" / "SKILL.md").exists())
+        self.assertTrue((bridge_dir / "skills" / "demo-demo" / "SKILL.md").exists())
         self.assertTrue((bridge_dir / "scripts" / "helper.py").exists())
         self.assertFalse((bridge_dir / "commands").exists())
         bridged_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -655,10 +671,74 @@ class AiHandoffTests(unittest.TestCase):
         self.assertNotIn("hooks", bridged_manifest)
         self.assertEqual(bridged_manifest["x-cc-bridge"]["sourcePlugin"], "demo")
         self.assertEqual(bridged_manifest["x-cc-bridge"]["agents"], ["cc_demo_helper"])
+        self.assertEqual(bridged_manifest["x-cc-bridge"]["commands"], ["demo-demo"])
         self.assertTrue(agent_path.read_text(encoding="utf-8").startswith("# x-cc-bridge: "))
         self.assertIn('name = "cc_demo_helper"', agent_path.read_text(encoding="utf-8"))
         registry = json.loads(registry_path.read_text(encoding="utf-8"))
         self.assertIn("cc-demo", [item["name"] for item in registry["plugins"]])
+
+    def test_selected_plugin_bridge_reports_partial_when_codex_install_fails(self) -> None:
+        self.add_installed_claude_plugin_cache()
+        manifest = self.module.build_manifest(str(self.project), last=1)
+        manifest["selected_global_action_ids"] = ["plugin:demo@demo-market"]
+
+        with mock.patch.object(
+            self.module,
+            "install_bridged_plugin",
+            return_value={
+                "selector": "cc-demo@cc-bridged-plugins",
+                "command": "codex plugin add cc-demo@cc-bridged-plugins",
+                "returncode": 1,
+                "stdout": "",
+                "stderr": "failed",
+                "installed": False,
+                "reason": "failed",
+            },
+        ):
+            results = self.module.apply_selected_global_actions(manifest)
+
+        self.assertEqual(results[0]["status"], "partial")
+        self.assertEqual(results[0]["reason"], "failed")
+        self.assertTrue((self.home / ".codex" / "plugins" / "cc-demo").exists())
+
+    def test_interactive_global_picker_checks_github_origins(self) -> None:
+        self.add_installed_claude_plugin_cache()
+        manifest = self.module.build_manifest(str(self.project), last=1)
+        manifest["selected_global_action_ids"] = ["plugin:demo@demo-market"]
+
+        with mock.patch.object(
+            self.module,
+            "gh_auth_status",
+            return_value={"available": True, "authenticated": True, "path": "/usr/bin/gh", "reason": ""},
+        ):
+            with mock.patch.object(self.module, "gh_api_path_exists", return_value=(False, "gh: Not Found (HTTP 404)")):
+                with mock.patch.object(self.module, "read_menu_key", return_value="apply"):
+                    stdout = io.StringIO()
+                    with contextlib.redirect_stdout(stdout):
+                        self.module.global_picker(manifest)
+
+        selected = manifest["selected_global_actions"][0]
+        self.assertTrue(selected["github_codex_checked"])
+        self.assertEqual(selected["codex_release_status"], "github-origin-checked-no-native")
+        self.assertIn("github-origin", selected["risk_badges"])
+
+    def test_selected_global_candidates_prefers_saved_github_metadata(self) -> None:
+        self.add_installed_claude_plugin_cache()
+        manifest = self.module.build_manifest(str(self.project), last=1)
+        saved = next(
+            item
+            for item in self.module.global_action_candidates(manifest)
+            if item["id"] == "plugin:demo@demo-market"
+        )
+        saved["github_codex_checked"] = True
+        saved["codex_release_status"] = "github-origin-checked-no-native"
+        manifest["selected_global_action_ids"] = ["plugin:demo@demo-market"]
+        manifest["selected_global_actions"] = [saved]
+
+        selected = self.module.selected_global_candidates(manifest)
+
+        self.assertTrue(selected[0]["github_codex_checked"])
+        self.assertEqual(selected[0]["codex_release_status"], "github-origin-checked-no-native")
 
     def test_globals_project_only_filters_global_inventory(self) -> None:
         (self.project / ".mcp.json").write_text(

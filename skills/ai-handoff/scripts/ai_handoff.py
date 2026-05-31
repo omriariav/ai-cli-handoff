@@ -1170,6 +1170,69 @@ def render_agent_toml(data: Dict[str, Any]) -> str:
     return "\n".join(f"{key} = {toml_literal(value)}" for key, value in data.items()) + "\n"
 
 
+def bridge_skill_name(source_plugin: str, command_name: str) -> str:
+    fallback = action_hash({"plugin": source_plugin, "command": command_name})
+    return stable_id_part(f"{source_plugin}-{command_name}", fallback)
+
+
+def normalize_command_allowed_tools(value: Any) -> str:
+    return str(value).replace(":*", "*")
+
+
+def render_command_skill(source_plugin: str, command_path: Path, existing_skill_names: set) -> Dict[str, str]:
+    raw_text = command_path.read_text(encoding="utf-8")
+    try:
+        frontmatter, body = parse_simple_frontmatter(raw_text)
+    except HandoffError:
+        frontmatter, body = {}, raw_text
+    command_name = command_path.stem
+    skill_name = bridge_skill_name(source_plugin, command_name)
+    if skill_name in existing_skill_names:
+        skill_name = stable_id_part(f"{source_plugin}-command-{command_name}", action_hash(str(command_path)))
+    description = str(frontmatter.get("description") or f"Converted Claude command /{source_plugin}:{command_name}")
+    lines = [
+        "---",
+        f"name: {skill_name}",
+        f"description: {description}",
+    ]
+    for key in ("argument-hint", "allowed-tools"):
+        if key in frontmatter and str(frontmatter[key]).strip():
+            value = normalize_command_allowed_tools(frontmatter[key]) if key == "allowed-tools" else str(frontmatter[key])
+            lines.append(f"{key}: {value}")
+    lines.extend(
+        [
+            "---",
+            "",
+            f"# /{source_plugin}:{command_name}",
+            "",
+            "Converted from a Claude Code plugin command. From this skill directory, resolve any `CLAUDE_PLUGIN_ROOT` references to `../..`.",
+            "When the command delegates to bundled implementation details, prefer the sibling skills and scripts copied with this bridge.",
+            "",
+            body,
+        ]
+    )
+    return {"skill_name": skill_name, "text": "\n".join(lines).rstrip() + "\n"}
+
+
+def convert_bridge_commands(source: Path, staged: Path, *, source_plugin: str) -> List[str]:
+    commands_dir = source / "commands"
+    if not commands_dir.is_dir():
+        return []
+    skills_dir = staged / "skills"
+    skills_dir.mkdir(parents=True, exist_ok=True)
+    existing = {path.name for path in skills_dir.iterdir() if path.is_dir()}
+    converted: List[str] = []
+    for command_path in sorted(commands_dir.glob("*.md")):
+        rendered = render_command_skill(source_plugin, command_path, existing)
+        skill_name = rendered["skill_name"]
+        skill_dir = skills_dir / skill_name
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        (skill_dir / "SKILL.md").write_text(rendered["text"], encoding="utf-8")
+        existing.add(skill_name)
+        converted.append(skill_name)
+    return converted
+
+
 def convert_bridge_agent(md_path: Path, *, bridge_name: str, source_plugin: str, synced_at: str) -> Dict[str, Any]:
     frontmatter, body = parse_simple_frontmatter(md_path.read_text(encoding="utf-8"))
     source_agent = str(frontmatter.get("name") or "")
@@ -1309,6 +1372,7 @@ def bridge_plugin_to_codex(candidate: Dict[str, Any]) -> Dict[str, Any]:
     try:
         staged.mkdir(parents=True, exist_ok=False)
         copy_bridge_plugin_body(source_path, staged)
+        command_skills = convert_bridge_commands(source_path, staged, source_plugin=source_plugin)
         bridged_manifest = dict(manifest)
         for key in BRIDGE_CC_ONLY_MANIFEST_KEYS:
             bridged_manifest.pop(key, None)
@@ -1322,6 +1386,7 @@ def bridge_plugin_to_codex(candidate: Dict[str, Any]) -> Dict[str, Any]:
             agents=new_agent_names,
             synced_at=synced_at,
         )
+        bridged_manifest[BRIDGE_MARKER_KEY]["commands"] = command_skills
         staged_manifest = staged / ".codex-plugin" / "plugin.json"
         staged_manifest.parent.mkdir(parents=True, exist_ok=True)
         staged_manifest.write_text(json.dumps(bridged_manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
@@ -1348,6 +1413,82 @@ def bridge_plugin_to_codex(candidate: Dict[str, Any]) -> Dict[str, Any]:
         "manifest": str(manifest_path),
         "registry": str(registry_path),
         "agents": new_agent_names,
+        "commands": command_skills,
+    }
+
+
+def install_bridged_plugin(bridge_name: str) -> Dict[str, Any]:
+    if not bridge_name:
+        raise HandoffError("missing bridged plugin name")
+    selector = f"{bridge_name}@{BRIDGE_REGISTRY_NAME}"
+    codex_path = shutil.which("codex") or "codex"
+    add_command = [codex_path, "plugin", "add", selector]
+    remove_command = [codex_path, "plugin", "remove", selector]
+
+    def run_command(command: List[str]) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=120,
+        )
+
+    try:
+        proc = run_command(add_command)
+    except Exception as exc:
+        return {
+            "selector": selector,
+            "command": " ".join(shlex.quote(part) for part in add_command),
+            "returncode": None,
+            "stdout": "",
+            "stderr": "",
+            "installed": False,
+            "reason": str(exc),
+        }
+    output = "\n".join(part for part in (proc.stdout.strip(), proc.stderr.strip()) if part)
+    already_installed = proc.returncode != 0 and "already installed" in output.lower()
+    remove_result: Optional[Dict[str, Any]] = None
+    if already_installed:
+        try:
+            remove_proc = run_command(remove_command)
+            remove_result = {
+                "command": " ".join(shlex.quote(part) for part in remove_command),
+                "returncode": remove_proc.returncode,
+                "stdout": truncate(remove_proc.stdout, 1200),
+                "stderr": truncate(remove_proc.stderr, 1200),
+            }
+            if remove_proc.returncode == 0:
+                proc = run_command(add_command)
+                output = "\n".join(part for part in (proc.stdout.strip(), proc.stderr.strip()) if part)
+                already_installed = False
+        except Exception as exc:
+            return {
+                "selector": selector,
+                "command": " ".join(shlex.quote(part) for part in add_command),
+                "remove": remove_result,
+                "returncode": None,
+                "stdout": truncate(proc.stdout, 1200),
+                "stderr": truncate(proc.stderr, 1200),
+                "installed": False,
+                "already_installed": True,
+                "reason": f"plugin was already installed, but reinstall failed: {exc}",
+            }
+    installed = proc.returncode == 0 or already_installed
+    reason = "" if installed else truncate(output or "codex plugin add failed", 1200)
+    if already_installed and remove_result and remove_result.get("returncode") != 0:
+        installed = False
+        reason = "plugin was already installed, but remove before reinstall failed"
+    return {
+        "selector": selector,
+        "command": " ".join(shlex.quote(part) for part in add_command),
+        "remove": remove_result,
+        "returncode": proc.returncode,
+        "stdout": truncate(proc.stdout, 1200),
+        "stderr": truncate(proc.stderr, 1200),
+        "installed": installed,
+        "already_installed": already_installed,
+        "reason": reason,
     }
 
 
@@ -3259,7 +3400,7 @@ def visible_global_candidates(manifest: Dict[str, Any], filter_text: str = "", m
     return sorted(
         [
             candidate
-            for candidate in global_action_candidates(manifest)
+            for candidate in display_global_action_candidates(manifest)
             if global_picker_matches(candidate, filter_text=filter_text, mode=mode)
         ],
         key=global_candidate_sort_key,
@@ -3267,7 +3408,14 @@ def visible_global_candidates(manifest: Dict[str, Any], filter_text: str = "", m
 
 
 def used_global_candidate_count(manifest: Dict[str, Any]) -> int:
-    return sum(1 for candidate in global_action_candidates(manifest) if candidate.get("used_in_selected_sessions"))
+    return sum(1 for candidate in display_global_action_candidates(manifest) if candidate.get("used_in_selected_sessions"))
+
+
+def display_global_action_candidates(manifest: Dict[str, Any]) -> List[Dict[str, Any]]:
+    candidates = manifest.get("_display_global_action_candidates")
+    if isinstance(candidates, list):
+        return [item for item in candidates if isinstance(item, dict)]
+    return global_action_candidates(manifest)
 
 
 def initial_global_picker_mode(manifest: Dict[str, Any]) -> str:
@@ -3356,7 +3504,7 @@ def render_global_picker(
     mode: str = "all",
     page_size: int = GLOBAL_PICKER_PAGE_SIZE,
 ) -> str:
-    all_candidates = global_action_candidates(manifest)
+    all_candidates = display_global_action_candidates(manifest)
     candidates = visible_global_candidates(manifest, filter_text=filter_text, mode=mode)
     selected_id_set = set(selected_ids if selected_ids is not None else manifest.get("selected_global_action_ids") or [])
     start, end = global_picker_page_window(cursor, len(candidates), page_size=page_size)
@@ -3386,6 +3534,16 @@ def render_global_picker(
             lines.append("Clear the filter with / then Enter, or press Tab to change views.")
         else:
             lines.append("No Codex-wide install candidates found.")
+    github_failures = [
+        candidate
+        for candidate in all_candidates
+        if candidate.get("github_codex_check_error")
+        and candidate.get("codex_release_status") != "github-origin-checked-no-native"
+    ]
+    if github_failures:
+        lines.append(
+            f"GitHub check failed for {len(github_failures)} candidate(s); bridge/manual fallbacks remain selectable."
+        )
     last_group = None
     for offset, candidate in enumerate(page, start=1):
         absolute_index = start + offset - 1
@@ -3541,7 +3699,8 @@ def global_picker_help() -> str:
 
 
 def global_picker(manifest: Dict[str, Any]) -> None:
-    all_candidates = global_action_candidates(manifest)
+    all_candidates = annotate_github_codex_releases(global_action_candidates(manifest))
+    manifest["_display_global_action_candidates"] = all_candidates
     if not all_candidates:
         show_message_screen("No Codex-wide install candidates found.")
         return
@@ -3570,7 +3729,7 @@ def global_picker(manifest: Dict[str, Any]) -> None:
         key = read_menu_key()
         action, cursor = apply_global_picker_key(key, cursor, len(candidates), page_size=page_size)
         if action == "done":
-            all_candidates = global_action_candidates(manifest)
+            all_candidates = display_global_action_candidates(manifest)
             manifest["selected_global_action_ids"] = selected_ids
             manifest["selected_global_actions"] = [candidate for candidate in all_candidates if candidate["id"] in selected_ids]
             return
@@ -3658,11 +3817,20 @@ def prompt_static_line(prompt: str) -> str:
 
 def selected_global_candidates(manifest: Dict[str, Any]) -> List[Dict[str, Any]]:
     selected_ids = set(manifest.get("selected_global_action_ids") or [])
+    saved = manifest.get("selected_global_actions")
+    if selected_ids and isinstance(saved, list):
+        saved_candidates = [
+            item
+            for item in saved
+            if isinstance(item, dict) and item.get("type") in GLOBAL_ACTION_TYPES and item.get("id") in selected_ids
+        ]
+        if saved_candidates:
+            saved_by_id = {str(item.get("id")): item for item in saved_candidates}
+            return [saved_by_id[action_id] for action_id in manifest.get("selected_global_action_ids") or [] if action_id in saved_by_id]
     if selected_ids:
         fresh = [candidate for candidate in global_action_candidates(manifest) if candidate["id"] in selected_ids]
         if fresh:
             return fresh
-    saved = manifest.get("selected_global_actions")
     if isinstance(saved, list) and saved:
         return [item for item in saved if isinstance(item, dict) and item.get("type") in GLOBAL_ACTION_TYPES]
     return []
@@ -3872,14 +4040,31 @@ def apply_selected_global_actions(manifest: Dict[str, Any]) -> List[Dict[str, An
                     }
                 )
                 continue
+            install_result = install_bridged_plugin(str(bridge_result.get("bridge") or ""))
+            if not install_result.get("installed"):
+                results.append(
+                    {
+                        "id": candidate["id"],
+                        "status": "partial",
+                        **bridge_result,
+                        "install": install_result,
+                        "reason": install_result.get("reason") or "bridged plugin was not installed by codex plugin add",
+                        "next_steps": [
+                            f"run {install_result.get('command')}",
+                            "restart Codex or open a new session",
+                        ],
+                    }
+                )
+                continue
             results.append(
                 {
                     "id": candidate["id"],
                     "status": "ok",
                     **bridge_result,
+                    "install": install_result,
                     "next_steps": [
                         "restart Codex or open a new session",
-                        "run /plugins and install the bridge from CC Bridged Plugins",
+                        "use the bridged plugin skills in a new Codex session",
                     ],
                 }
             )
