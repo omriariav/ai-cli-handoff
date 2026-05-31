@@ -4507,7 +4507,12 @@ def load_manifest_or_build(path: str) -> Tuple[Optional[Dict[str, Any]], int]:
     if isinstance(saved, dict):
         selected_ids = [str(item) for item in saved.get("selected_global_action_ids") or [] if item]
         manifest["selected_global_action_ids"] = selected_ids
-        manifest["selected_global_actions"] = [
+        saved_actions = [
+            item
+            for item in saved.get("selected_global_actions") or []
+            if isinstance(item, dict) and item.get("id") in set(selected_ids)
+        ]
+        manifest["selected_global_actions"] = saved_actions or [
             candidate for candidate in global_action_candidates(manifest) if candidate.get("id") in set(selected_ids)
         ]
         if saved.get("global_selection"):
@@ -4587,6 +4592,8 @@ def command_globals_select(args: argparse.Namespace) -> int:
         project_only=bool(getattr(args, "project_only", False)),
         portable_only=bool(getattr(args, "portable_only", False)),
     )
+    if not bool(getattr(args, "no_check_github", False)):
+        candidates = annotate_github_codex_releases(candidates)
     try:
         action_ids, actions = resolve_global_selectors(
             manifest,
@@ -4663,6 +4670,8 @@ def command_globals_apply(args: argparse.Namespace) -> int:
             project_only=bool(getattr(args, "project_only", False)),
             portable_only=bool(getattr(args, "portable_only", False)),
         )
+        if not bool(getattr(args, "no_check_github", False)):
+            candidates = annotate_github_codex_releases(candidates)
         try:
             action_ids, actions = resolve_global_selectors(
                 manifest,
