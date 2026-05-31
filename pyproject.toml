@@ -1,0 +1,19 @@
+[project]
+name = "ai-cli-handoff"
+version = "0.1.0"
+description = "Prepare Claude Code projects for Codex handoff."
+requires-python = ">=3.9"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project.scripts]
+ai-handoff = "ai_handoff.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

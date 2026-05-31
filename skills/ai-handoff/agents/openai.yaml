@@ -1,0 +1,4 @@
+interface:
+  display_name: "AI Handoff"
+  short_description: "Prepare a Claude Code project for Codex handoff."
+  default_prompt: "Prepare this folder for Codex handoff from Claude Code context."

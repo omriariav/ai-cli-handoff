@@ -1,0 +1,121 @@
+# AI Handoff CLI UX
+
+## Principles
+
+- Default to an interactive dry run.
+- Make project-local writes easy and Codex-wide installs deliberate.
+- Prefer short, memorable commands over hidden flags.
+- Keep status language concrete: found, missing, selected, discovered, written.
+- Preserve auditability with `.codex/handoff/manifest.json` and run history.
+
+## Command Surface
+
+- `ai-handoff <path>`: interactive dry-run scan.
+- `ai-handoff conversations <path>`: list candidate Claude sessions and selected IDs.
+- `ai-handoff conversations <path> --all-projects --search TEXT`: recover sessions after folder moves or renamed Claude project keys.
+- `ai-handoff scan <path>`: non-mutating scan.
+- `ai-handoff diff <path>`: preview exact project-local writes.
+- `ai-handoff privacy <path>`: show the private/local context categories that may be persisted.
+- `ai-handoff apply <path>`: project-local apply.
+- `ai-handoff globals <path>`: list MCP, skill, and plugin import candidates.
+- `ai-handoff globals <path> --project-only`: list only project-evidenced candidates.
+- `ai-handoff globals <path> --portable-only`: list only candidates without obvious local-machine dependencies.
+- `ai-handoff globals <path> --include-risky`: include unverified plugins and risky bulk-selection candidates.
+- `ai-handoff globals <path> --check-github`: use authenticated `gh` to check for native Codex manifests on GitHub origins. This is the default.
+- `ai-handoff globals <path> --no-check-github`: skip GitHub checks and use local metadata only.
+- `ai-handoff globals select <path> --select ID[,ID] --yes --ack-privacy`: persist exact Codex-wide install selection without executing it.
+- `ai-handoff globals apply <path>`: execute installs selected in the interactive Codex-wide install picker.
+- `ai-handoff init <path>`: project-learning pass only.
+- `ai-handoff history [path]`: show previous runs.
+- `ai-handoff show <run-id> --path <path>`: inspect a manifest.
+- `ai-handoff doctor [path]`: check local Claude/Codex readiness.
+
+## Default Selection
+
+Enabled by default:
+
+- Summarize latest relevant Claude work.
+- Create or update `AGENTS.md`.
+- Write `.codex/handoff/summary.md`.
+- Write `.codex/handoff/manifest.json`.
+
+Disabled by default:
+
+- MCP installs.
+- Skill conversions.
+- Plugin installs.
+- Fuller transcript excerpts.
+- Any write under `~/.codex`.
+
+## Safety Details
+
+`--yes` may skip prompts only for project-local writes. It must not install MCPs, copy skills into `~/.codex/skills`, bridge plugins into `~/.codex/plugins`, edit Codex-wide config, or install plugins.
+
+Generated MCP commands and Claude plugin records are discovered candidates. They are recorded in the manifest so a user or agent can review and select them later with explicit approval. A Claude plugin record is not proof of a direct Codex plugin install. If it has a local Claude `installPath` cache with a `.claude-plugin/plugin.json`, offer an embedded bridge candidate: copy the plugin body into `~/.codex/plugins/cc-<name>`, drop Claude-only `hooks/`, `commands/`, `agents/`, and plugin metadata dirs, convert `agents/*.md` into Codex TOML under `~/.codex/agents`, add `x-cc-bridge`, and upsert `~/.agents/plugins/marketplace.json`. Before presenting the bridge, inspect origin metadata from `known_marketplaces.json`, local marketplace `marketplace.json`, local `.git/config`, and cached `.codex-plugin/plugin.json`; mark `codex-native` when a native Codex manifest exists locally. By default, `globals` may also run authenticated `gh` checks; only add `github-origin` after `gh` exists, `gh auth status` succeeds, and `gh api` checks the native manifest path. If `gh` is missing, unauthenticated, or the API check fails, say that the GitHub check failed and keep the bridge/manual fallback visible. `--no-check-github` disables this default network-backed check. If no local cache exists, keep it manual until a Codex `.codex-plugin/plugin.json`, Codex marketplace entry, or external bridge flow such as `cc2codex plugin-sync` has been verified.
+
+Privacy acknowledgement is required when handoff artifacts include Claude sessions or local MCP/skill/plugin inventory. `privacy` should make the categories explicit before apply: prompts, assistant notes, commands, transcript paths, MCP configs, skill/plugin names, nearby Claude project keys, and local paths.
+
+Codex-wide install selection must be persistable outside the interactive menu. `globals select` writes only `.codex/handoff/manifest.json` plus a run snapshot, never `AGENTS.md`, and never changes `~/.codex`. `--select` accepts exact IDs, skill names, category aliases (`mcps`, `skills`, `plugins`), and `all`; IDs should be stable and human-readable where possible, for example `mcp:filesystem` and `skill:amq-cli`.
+
+The globals view should group candidates as Recommended, Review, and Manual/Unsafe. JSON candidates must include `source_scope`, `risk_badges`, `why_relevant`, `evidence`, `relevance_score`, `portable`, and `blocked_reason`. Bulk selectors (`all`, `skills`, `plugins`, etc.) must not include `secret`, `unverified`, or Codex-wide candidates unless `--include-risky` is present.
+
+Transcript-derived usage should make Codex-wide install review sharper. Scan selected Claude JSONL transcripts for actual `Skill` tool invocations, `mcp__server__tool` names, loaded skill metadata (`<skill-format>true</skill-format>` / `<command-name>`), and `attributionSkill` / `attributionPlugin`. Ignore initial available-skill attachments. Matching candidates should be marked `used-in-transcripts`, sorted ahead of otherwise similar candidates, and keep execution safety unchanged. If any transcript-used candidates exist, the interactive picker should open in `used` view rather than `all`; `Tab` exposes the full discovered inventory.
+
+Conversation recovery must not depend on one exact Claude project folder. `conversations` and `scan` should support exact session IDs from moved projects, `--all-projects`, `--from-claude-project KEY`, `--search TEXT`, and `--branch NAME`. Candidate rows should include `source_project_key` so users know where recovered context came from.
+
+## Interactive Menu
+
+The menu should be static in TTY mode: redraw in place instead of appending a new menu after every keypress. Do not use an alternate screen; clear and redraw the current viewport so the interaction feels like Mole while still leaving final apply output in the normal terminal.
+
+The menu should support both direct numeric toggles and cursor-driven operation:
+
+- `Up` or `k`: move to the previous item.
+- `Down` or `j`: move to the next item.
+- `Space`: toggle the highlighted item.
+- Number keys: toggle that numbered item.
+- `c`: open the conversation picker. Defaults are latest relevant non-observer sessions, but the user must be able to select exact sessions before apply.
+- `g`: open the Codex-wide install picker. This selects exact MCP, skill, and plugin installs. Discovery alone must not check the parent Codex-wide installs row.
+- `p`: show the preview as a static screen, then return to the menu after a keypress.
+- `Enter` or `a`: apply project-local writes.
+- `q`: quit without changing files.
+
+Final apply or quit output should clear the menu and print a normal terminal result.
+
+### Conversation Picker
+
+The conversation picker should use the same static viewport behavior as the main menu. It should expose:
+
+- `/`: enter filter text across session ID, title, summary, first prompt, source project key, branch, transcript path, and project path. Empty filter clears it.
+- `f` / `b`: page forward/backward.
+- `d`: show full conversation details including source project key, branch, transcript path, prompt, and summary.
+- `Space`/`x` and number keys: toggle the highlighted or visible numbered conversation by session ID.
+- `Enter`/`a`: commit the draft conversation selection.
+- `q`: cancel without changing the prior conversation selection.
+
+Header text should include the active filter, visible range, page number, total filtered count, total candidate count, and selected count. The footer should show the all-project recovery command for moved or renamed projects.
+
+Codex-wide installs should be explicit:
+
+- MCP entries run the recorded `codex mcp add ...` command after confirmation.
+- Skill entries copy the selected Claude skill folder into `~/.codex/skills` if no destination already exists.
+- Plugin entries with `bridge=true` run the embedded bridge. Verified non-bridge plugin entries may run the recorded `codex plugin add ...` command after confirmation.
+- Commands containing redacted values must be skipped and reported as manual follow-up.
+
+### Global Picker
+
+The Codex-wide install picker should use the same static viewport behavior as the main menu. It should expose:
+
+- `/`: enter filter text across IDs, labels, commands, evidence, why-relevant text, risk badges, source path, and blocked reason. Empty filter clears it.
+- `Tab`: cycle `used`, `all`, `mcp`, `skill`, `plugin`, and `manual` views.
+- `f` / `b`: page forward/backward.
+- `d`: show full candidate details without truncating commands, paths, badges, blocked reason, or manual steps.
+- `A`: select all safe visible candidates. It must skip `secret`, `unverified`, `blocked_reason`, and Codex-wide candidates.
+- `u`: clear selected visible candidates.
+- `C`: clear all selected candidates.
+- `i`: invert safe visible candidates while skipping `secret`, `unverified`, `blocked_reason`, and Codex-wide candidates.
+- `Space`/`x` and number keys: toggle the highlighted or visible numbered candidate by candidate ID.
+- `?`: show help.
+- `Enter`/`a`: commit the draft import selection.
+- `q`: cancel without changing the prior import selection.
+
+Header text should include the active view, filter, visible range, page number, total filtered count, total candidate count, risky count, and selected count. Page size should adapt to terminal height where possible. Empty states should explain whether no candidates exist or no candidates match the active filter/view.
