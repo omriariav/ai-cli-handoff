@@ -1231,6 +1231,20 @@ class AiHandoffTests(unittest.TestCase):
         self.assertEqual(manifest["flow"]["id"], "codex_to_claude")
         self.assertIn("not implemented yet", stdout.getvalue())
 
+    def test_wizard_claude_context_step_clears_flow_step_in_static_mode(self) -> None:
+        manifest = self.module.build_manifest(str(self.project), last=1)
+        stdout = io.StringIO()
+
+        with mock.patch.object(self.module, "supports_static_menu", return_value=True):
+            with mock.patch.object(self.module, "wizard_answer", return_value="q"):
+                with contextlib.redirect_stdout(stdout):
+                    continued = self.module.wizard_review_sessions(manifest)
+
+        self.assertFalse(continued)
+        rendered = stdout.getvalue()
+        self.assertTrue(rendered.startswith(self.module.ANSI_CLEAR_VIEWPORT))
+        self.assertIn("Step 1/3: Claude Context", rendered)
+
     def test_wizard_project_files_step_clears_previous_step_in_static_mode(self) -> None:
         manifest = self.module.build_manifest(str(self.project), last=1)
         stdout = io.StringIO()
@@ -1351,6 +1365,40 @@ class AiHandoffTests(unittest.TestCase):
 
         self.assertTrue(continued)
         self.assertEqual(len(manifest["selected_global_action_ids"]), 1)
+
+    def test_wizard_tooling_reports_already_installed_bridged_plugins(self) -> None:
+        self.add_installed_claude_plugin_cache()
+        codex_plugin = self.home / ".codex" / "plugins" / "cc-demo"
+        (codex_plugin / ".codex-plugin").mkdir(parents=True)
+        (codex_plugin / ".codex-plugin" / "plugin.json").write_text(
+            json.dumps({"name": "cc-demo", "version": "1.0.0"}),
+            encoding="utf-8",
+        )
+        with self.session_path.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    {
+                        "attributionPlugin": "demo",
+                        "message": {"role": "assistant", "content": "used demo plugin"},
+                    }
+                )
+                + "\n"
+            )
+
+        manifest = self.module.build_manifest(str(self.project), last=1)
+        candidate_ids = {item["id"] for item in self.module.global_action_candidates(manifest)}
+        already_available = self.module.already_available_conversation_tools(manifest)
+        stdout = io.StringIO()
+
+        with mock.patch.object(self.module, "wizard_answer", return_value="n"):
+            with contextlib.redirect_stdout(stdout):
+                continued = self.module.wizard_review_globals(manifest, project_applied=False)
+
+        self.assertTrue(continued)
+        self.assertNotIn("plugin:demo@demo-market", candidate_ids)
+        self.assertIn("plugin:demo@demo-market", [item["id"] for item in already_available])
+        self.assertIn("Already available for this Codex user", stdout.getvalue())
+        self.assertIn("cc-demo", stdout.getvalue())
 
     def test_matched_tooling_picker_renders_checkboxes(self) -> None:
         self.append_transcript_usage_events()

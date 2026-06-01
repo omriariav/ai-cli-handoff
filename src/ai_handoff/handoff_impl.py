@@ -2273,14 +2273,60 @@ def discover_codex() -> Dict[str, Any]:
     config = load_toml(config_path)
     mcp_tables = config.get("mcp_servers") or config.get("mcpServers") or {}
     plugins = config.get("plugins") or {}
+    plugin_inventory = discover_codex_plugin_inventory(home)
+    plugin_names = set(plugins.keys()) if isinstance(plugins, dict) else set()
+    plugin_names.update(plugin_inventory.get("names") or [])
     return {
         "config_path": str(config_path),
         "config_exists": config_path.exists(),
         "projects": config.get("projects") if isinstance(config.get("projects"), dict) else {},
         "mcp_names": sorted(mcp_tables.keys()) if isinstance(mcp_tables, dict) else [],
-        "plugin_names": sorted(plugins.keys()) if isinstance(plugins, dict) else [],
+        "plugin_names": sorted(plugin_names),
+        "plugin_inventory": plugin_inventory,
         "skills_dir": str(home / ".codex" / "skills"),
     }
+
+
+def add_codex_plugin_inventory_name(
+    names: set,
+    paths_by_name: Dict[str, str],
+    name: Any,
+    path: Path,
+) -> None:
+    text = str(name or "").strip()
+    if not text:
+        return
+    names.add(text)
+    paths_by_name.setdefault(text, str(path))
+
+
+def discover_codex_plugin_inventory(home: Path) -> Dict[str, Any]:
+    plugins_dir = home / ".codex" / "plugins"
+    names: set = set()
+    paths_by_name: Dict[str, str] = {}
+    if not plugins_dir.exists():
+        return {"names": [], "paths_by_name": {}}
+    manifest_paths = list(plugins_dir.glob("*/.codex-plugin/plugin.json"))
+    manifest_paths.extend(plugins_dir.glob("cache/*/*/.codex-plugin/plugin.json"))
+    manifest_paths.extend(plugins_dir.glob("cache/*/*/*/.codex-plugin/plugin.json"))
+    for manifest_path in manifest_paths:
+        plugin_dir = manifest_path.parent.parent
+        manifest = load_json(manifest_path)
+        if not isinstance(manifest, dict):
+            continue
+        dir_name = plugin_dir.name
+        add_codex_plugin_inventory_name(names, paths_by_name, dir_name, plugin_dir)
+        add_codex_plugin_inventory_name(names, paths_by_name, manifest.get("name"), plugin_dir)
+        marker = manifest.get(BRIDGE_MARKER_KEY)
+        if isinstance(marker, dict):
+            add_codex_plugin_inventory_name(names, paths_by_name, marker.get("sourceSelector"), plugin_dir)
+            add_codex_plugin_inventory_name(names, paths_by_name, marker.get("sourcePlugin"), plugin_dir)
+            marketplace = str(marker.get("marketplace") or "")
+            source_plugin = str(marker.get("sourcePlugin") or "")
+            if marketplace and source_plugin:
+                add_codex_plugin_inventory_name(names, paths_by_name, f"{source_plugin}@{marketplace}", plugin_dir)
+            add_codex_plugin_inventory_name(names, paths_by_name, f"{dir_name}@{BRIDGE_REGISTRY_NAME}", plugin_dir)
+    return {"names": sorted(names), "paths_by_name": paths_by_name}
 
 
 def codex_trust_for_project(project: Path, codex: Dict[str, Any]) -> Optional[str]:
@@ -2374,6 +2420,7 @@ def discover_claude_config(project: Path, codex: Dict[str, Any]) -> Dict[str, An
         candidate.update(candidate_scope_and_risk("skill", candidate, project))
     for candidate in plugin_candidates:
         candidate.update(candidate_scope_and_risk("plugin", candidate, project))
+        mark_existing_codex_plugin(candidate, codex)
         add_plugin_setup_captures(setup_capture, candidate)
     return {
         "mcp_candidates": mcp_candidates,
@@ -2383,6 +2430,38 @@ def discover_claude_config(project: Path, codex: Dict[str, Any]) -> Dict[str, An
         "skill_candidates": skill_candidates,
         "plugin_candidates": plugin_candidates,
     }
+
+
+def mark_existing_codex_plugin(candidate: Dict[str, Any], codex: Dict[str, Any]) -> None:
+    names = set(str(item) for item in codex.get("plugin_names") or [])
+    paths_by_name = codex.get("plugin_inventory", {}).get("paths_by_name", {})
+    if not isinstance(paths_by_name, dict):
+        paths_by_name = {}
+    bridge_name = str(candidate.get("bridge_name") or "")
+    selector = str(candidate.get("name") or "")
+    plugin_name = str(candidate.get("plugin_name") or "")
+    marketplace = str(candidate.get("marketplace") or candidate.get("bridge_marketplace") or "")
+    bridge_selector = f"{bridge_name}@{BRIDGE_REGISTRY_NAME}" if bridge_name else ""
+    source_selector = f"{plugin_name}@{marketplace}" if plugin_name and marketplace else ""
+    probes = [bridge_name, bridge_selector, selector, source_selector, plugin_name]
+    destination = Path(str(candidate.get("bridge_destination_path") or "")).expanduser() if candidate.get("bridge_destination_path") else None
+    existing_path = ""
+    existing_name = ""
+    for probe in probes:
+        if probe and probe in names:
+            existing_name = probe
+            existing_path = str(paths_by_name.get(probe) or "")
+            break
+    if not existing_name and destination and (destination / ".codex-plugin" / "plugin.json").exists():
+        existing_name = bridge_name or destination.name
+        existing_path = str(destination)
+    if not existing_name:
+        return
+    candidate["already_in_codex"] = True
+    candidate["codex_existing_plugin"] = existing_name
+    candidate["codex_existing_path"] = existing_path
+    candidate["compatible_action"] = "already installed for this Codex user"
+    candidate["why_relevant"] = "Already available in this Codex user's plugin setup."
 
 
 def candidate_scope_and_risk(action_type: str, item: Dict[str, Any], project: Path) -> Dict[str, Any]:
@@ -2597,6 +2676,7 @@ def build_manifest(
             "trust_level": codex_trust_for_project(project, codex),
             "mcp_names": codex["mcp_names"],
             "plugin_names": codex["plugin_names"],
+            "plugin_inventory": codex.get("plugin_inventory", {}),
             "skills_dir": codex["skills_dir"],
         },
         "claude": {
@@ -3894,6 +3974,8 @@ def hidden_global_candidate_counts(manifest: Dict[str, Any], visible: List[Dict[
 
 def candidate_can_be_carried_over(candidate: Dict[str, Any]) -> bool:
     badges = set(candidate.get("risk_badges") or [])
+    if candidate.get("already_in_codex"):
+        return False
     if candidate.get("blocked_reason") or "secret" in badges:
         return False
     if candidate.get("confidence") == "low" and not candidate.get("bridge"):
@@ -3916,7 +3998,51 @@ def conversation_matched_global_candidates(manifest: Dict[str, Any]) -> List[Dic
     ]
 
 
+def already_available_conversation_tools(manifest: Dict[str, Any]) -> List[Dict[str, Any]]:
+    config = manifest.get("claude", {}).get("config", {})
+    usage_summary = manifest.get("claude", {}).get("sessions", {}).get("usage_summary") or {}
+    rows: List[Dict[str, Any]] = []
+    for action_type, key in (
+        ("mcp", "mcp_candidates"),
+        ("skill", "skill_candidates"),
+        ("plugin", "plugin_candidates"),
+    ):
+        for item in config.get(key) or []:
+            if not isinstance(item, dict) or not item.get("already_in_codex"):
+                continue
+            name = str(item.get("name") or Path(str(item.get("path") or "")).name)
+            row = annotate_candidate_with_transcript_usage(
+                {
+                    "id": f"{action_type}:{name}",
+                    "type": action_type,
+                    "name": name,
+                    "label": item.get("compatible_action") or "already available in Codex",
+                    "already_in_codex": True,
+                    "codex_existing_plugin": item.get("codex_existing_plugin", ""),
+                    "codex_existing_path": item.get("codex_existing_path", ""),
+                    "why_relevant": item.get("why_relevant", "Already available in Codex."),
+                    "risk": item.get("risk", "low"),
+                    "risk_badges": item.get("risk_badges") or ["codex-wide"],
+                    "source_scope": item.get("source_scope", "global"),
+                },
+                usage_summary,
+            )
+            if row.get("used_in_selected_sessions"):
+                rows.append(row)
+    seen = set()
+    result = []
+    for row in sorted(rows, key=lambda item: str(item.get("id") or "")):
+        row_id = str(row.get("id") or "")
+        if row_id in seen:
+            continue
+        seen.add(row_id)
+        result.append(row)
+    return result
+
+
 def global_candidate_group(candidate: Dict[str, Any]) -> str:
+    if candidate.get("already_in_codex"):
+        return "Already Available"
     if candidate.get("used_in_selected_sessions") and candidate_can_be_carried_over(candidate):
         return "Conversation Matched"
     if candidate.get("blocked_reason") or candidate.get("risk") == "high" or candidate.get("confidence") == "low":
@@ -3927,7 +4053,7 @@ def global_candidate_group(candidate: Dict[str, Any]) -> str:
 
 
 def global_candidate_sort_key(candidate: Dict[str, Any]) -> Tuple[int, str, str]:
-    group_order = {"Conversation Matched": 0, "Recommended": 1, "Review": 2, "Manual / Unsafe": 3}
+    group_order = {"Conversation Matched": 0, "Recommended": 1, "Review": 2, "Manual / Unsafe": 3, "Already Available": 4}
     return (
         group_order.get(global_candidate_group(candidate), 9),
         0 if candidate.get("used_in_selected_sessions") else 1,
@@ -4898,6 +5024,8 @@ def wizard_select_flow(manifest: Dict[str, Any]) -> bool:
 
 def wizard_review_sessions(manifest: Dict[str, Any]) -> bool:
     while True:
+        if supports_static_menu():
+            sys.stdout.write(ANSI_CLEAR_VIEWPORT)
         sessions = manifest["claude"]["sessions"]
         print(step_heading("Step 1/3", "Claude Context"))
         print(f"Selected {sessions.get('selected_count', 0)} of {sessions.get('found_count', 0)} discovered session(s).")
@@ -5406,6 +5534,7 @@ def wizard_review_globals(manifest: Dict[str, Any], project_applied: bool) -> bo
     manifest["_display_global_action_candidates"] = all_candidates
     summary = wizard_global_candidate_summary(manifest)
     matched_candidates = conversation_matched_global_candidates(manifest)
+    already_available = already_available_conversation_tools(manifest)
     wizard_tooling_progress(
         progress_lines,
         f"Ready: {len(matched_candidates)} selectable conversation-matched action(s), {summary['total']} total discovered.",
@@ -5432,6 +5561,20 @@ def wizard_review_globals(manifest: Dict[str, Any], project_applied: bool) -> bo
     print("These were found in Claude config/project context, but were not necessarily used.")
     for line in claude_setup_capture_lines(manifest, prefix="  - "):
         print(line)
+    if already_available:
+        print()
+        print("Already available for this Codex user:")
+        print("These were used in the selected conversations but are already installed/configured for Codex.")
+        for item in already_available[:8]:
+            existing = str(item.get("codex_existing_plugin") or item.get("name") or item.get("id"))
+            path = str(item.get("codex_existing_path") or "")
+            suffix = f" ({path})" if path else ""
+            usage = item.get("transcript_usage") or {}
+            usage_count = int(usage.get("count") or 0)
+            usage_text = f", used {usage_count}x" if usage_count else ""
+            print(f"  - {item.get('id')} -> {existing}{suffix}{usage_text}")
+        if len(already_available) > 8:
+            print(f"  - +{len(already_available) - 8} more")
     if summary["total"] == 0:
         print("No tooling carryover actions found.")
         return True
