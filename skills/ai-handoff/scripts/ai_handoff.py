@@ -3312,6 +3312,10 @@ def normalize_menu_key(raw: str) -> str:
         return "clear-visible"
     if lowered in {"i", "invert", "invert-visible"}:
         return "invert-visible"
+    if lowered in {"e", "expand"}:
+        return "expand"
+    if lowered in {"s", "skip"}:
+        return "skip"
     if lowered in {"f", "pagedown", "page-down"}:
         return "page-down"
     if lowered in {"b", "pageup", "page-up"}:
@@ -5067,6 +5071,246 @@ def wizard_select_matched_tooling(candidates: List[Dict[str, Any]]) -> Tuple[str
         return "selected", selected
 
 
+def tooling_picker_matches(candidate: Dict[str, Any], filter_text: str = "") -> bool:
+    if not filter_text.strip():
+        return True
+    needle = filter_text.lower()
+    haystack = " ".join(
+        str(candidate.get(key) or "")
+        for key in (
+            "id",
+            "type",
+            "label",
+            "name",
+            "why_relevant",
+            "evidence",
+            "bridge_name",
+            "origin_github_repo",
+            "codex_release_status",
+        )
+    ).lower()
+    badges = " ".join(str(item) for item in candidate.get("risk_badges") or []).lower()
+    return needle in haystack or needle in badges
+
+
+def visible_tooling_picker_candidates(candidates: List[Dict[str, Any]], filter_text: str = "") -> List[Dict[str, Any]]:
+    return [candidate for candidate in candidates if tooling_picker_matches(candidate, filter_text=filter_text)]
+
+
+def tooling_picker_counts(candidates: List[Dict[str, Any]]) -> Dict[str, int]:
+    return {
+        "total": len(candidates),
+        "plugin": sum(1 for candidate in candidates if candidate.get("type") == "plugin"),
+        "skill": sum(1 for candidate in candidates if candidate.get("type") == "skill"),
+        "mcp": sum(1 for candidate in candidates if candidate.get("type") == "mcp"),
+    }
+
+
+def render_matched_tooling_picker(
+    manifest: Dict[str, Any],
+    candidates: List[Dict[str, Any]],
+    *,
+    cursor: int = 0,
+    selected_ids: Optional[List[str]] = None,
+    filter_text: str = "",
+    page_size: int = GLOBAL_PICKER_PAGE_SIZE,
+    additional_count: int = 0,
+) -> str:
+    visible = visible_tooling_picker_candidates(candidates, filter_text=filter_text)
+    selected_id_set = set(selected_ids if selected_ids is not None else [str(item.get("id")) for item in candidates])
+    start, end = global_picker_page_window(cursor, len(visible), page_size=page_size)
+    page = visible[start:end]
+    page_count = max(1, (len(visible) + page_size - 1) // page_size)
+    current_page = 1 if not visible else (start // page_size) + 1
+    counts = tooling_picker_counts(candidates)
+    lines = [
+        "",
+        step_heading("Step 3/3", "Tooling & Claude Setup Carryover"),
+        "",
+        "Choose Conversation-Detected Carryover",
+        "These tools were actually used in the Claude conversations you selected.",
+        (
+            f"Detected: {counts['total']} total | {counts['plugin']} plugin(s), "
+            f"{counts['skill']} skill(s), {counts['mcp']} MCP(s)"
+        ),
+        (
+            f"Filter: {filter_text or 'none'} | Showing: {start + 1 if visible else 0}-{end} of {len(visible)} | "
+            f"Page: {current_page}/{page_count} | Selected: {len(selected_id_set)}"
+        ),
+    ]
+    if additional_count > 0:
+        lines.append(
+            f"Expand to full Claude setup: {additional_count} additional candidate(s) outside this picker."
+        )
+    setup_counts = setup_capture_summary(manifest)
+    lines.append(
+        "Captured setup: "
+        f"{setup_counts['hooks']} hook(s), {setup_counts['rules']} rule(s), "
+        f"{setup_counts['references']} reference(s), {setup_counts['statusline']} statusline config(s)"
+    )
+    lines.append("")
+    if not visible:
+        if candidates and filter_text:
+            lines.append("No conversation-detected tools match this filter.")
+            lines.append("Clear the filter with / then Enter.")
+        else:
+            lines.append("No conversation-detected carryover tools found.")
+    for offset, candidate in enumerate(page, start=1):
+        absolute_index = start + offset - 1
+        candidate_id = str(candidate.get("id") or "")
+        mark = "x" if candidate_id in selected_id_set else " "
+        pointer = ">" if absolute_index == cursor else " "
+        badges = display_risk_badges(candidate) or "none"
+        usage = candidate.get("transcript_usage") or {}
+        usage_count = int(usage.get("count") or 0)
+        usage_text = f" | used {usage_count}x" if usage_count else " | used"
+        lines.append(
+            f"{pointer} {offset}. [{mark}] {candidate_id} | "
+            f"risk={candidate.get('risk', 'unknown')} | {badges}{usage_text}"
+        )
+        lines.append(f"    {truncate(tooling_candidate_line(candidate), 140)}")
+    lines.extend(
+        [
+            "",
+            "Commands: Up/k Down/j, f/b page, Space/x toggle, number toggles, A select all, u clear visible, C clear all, / filter, d details, e expand full setup, Enter done, s skip, q quit",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def apply_matched_tooling_picker_key(
+    key: str,
+    cursor: int,
+    count: int,
+    page_size: int = GLOBAL_PICKER_PAGE_SIZE,
+) -> Tuple[str, int]:
+    if count <= 0:
+        if key in {"filter", "help", "expand", "globals", "skip", "quit", "select-visible", "clear-visible", "clear-all"}:
+            return "cancel" if key == "quit" else key, 0
+        if key == "apply":
+            return "done", 0
+        return "continue", 0
+    if key == "up":
+        return "continue", (cursor - 1) % count
+    if key == "down":
+        return "continue", (cursor + 1) % count
+    if key == "page-up":
+        return "continue", max(0, cursor - page_size)
+    if key == "page-down":
+        return "continue", min(count - 1, cursor + page_size)
+    if key in {
+        "toggle",
+        "filter",
+        "details",
+        "select-visible",
+        "clear-visible",
+        "clear-all",
+        "expand",
+        "globals",
+        "skip",
+    }:
+        return key, cursor
+    if key.startswith("toggle:"):
+        return key, cursor
+    if key == "apply":
+        return "done", cursor
+    if key == "quit":
+        return "cancel", cursor
+    return "continue", cursor
+
+
+def matched_tooling_picker(
+    manifest: Dict[str, Any],
+    candidates: List[Dict[str, Any]],
+    *,
+    additional_count: int = 0,
+) -> Tuple[str, List[Dict[str, Any]]]:
+    if not candidates:
+        return "skip", []
+    selected_ids = [str(candidate.get("id")) for candidate in candidates if candidate.get("id")]
+    cursor = 0
+    filter_text = ""
+    while True:
+        page_size = global_picker_page_size()
+        visible = visible_tooling_picker_candidates(candidates, filter_text=filter_text)
+        if cursor >= len(visible):
+            cursor = max(0, len(visible) - 1)
+        if supports_static_menu():
+            sys.stdout.write(ANSI_CLEAR_VIEWPORT)
+        print(
+            render_matched_tooling_picker(
+                manifest,
+                candidates,
+                cursor=cursor,
+                selected_ids=selected_ids,
+                filter_text=filter_text,
+                page_size=page_size,
+                additional_count=additional_count,
+            ),
+            flush=True,
+        )
+        action, cursor = apply_matched_tooling_picker_key(
+            read_menu_key(),
+            cursor,
+            len(visible),
+            page_size=page_size,
+        )
+        if action == "done":
+            selected = [candidate for candidate in candidates if str(candidate.get("id")) in set(selected_ids)]
+            if not selected:
+                return "skip", []
+            return "selected", selected
+        if action == "cancel":
+            return "quit", []
+        if action == "skip":
+            return "skip", []
+        if action in {"expand", "globals"}:
+            return "expand", []
+        if action == "filter":
+            if supports_static_menu():
+                sys.stdout.write(ANSI_CLEAR_VIEWPORT)
+            filter_text = prompt_static_line("Filter carryover tools (empty clears): ").strip()
+            cursor = 0
+            continue
+        if action == "details":
+            if visible:
+                show_message_screen(render_global_candidate_details(visible[cursor]))
+            continue
+        if action == "select-visible":
+            for candidate in visible:
+                candidate_id = str(candidate.get("id") or "")
+                if candidate_id and candidate_id not in selected_ids:
+                    selected_ids.append(candidate_id)
+            continue
+        if action == "clear-visible":
+            visible_ids = {str(candidate.get("id") or "") for candidate in visible}
+            selected_ids = [candidate_id for candidate_id in selected_ids if candidate_id not in visible_ids]
+            continue
+        if action == "clear-all":
+            selected_ids = []
+            continue
+        if action == "toggle":
+            if not visible:
+                continue
+            candidate_id = str(visible[cursor].get("id") or "")
+            if candidate_id in selected_ids:
+                selected_ids.remove(candidate_id)
+            elif candidate_id:
+                selected_ids.append(candidate_id)
+        elif action.startswith("toggle:"):
+            visible_number = int(action.split(":", 1)[1])
+            visible_index = 9 if visible_number == 0 else visible_number - 1
+            start, end = global_picker_page_window(cursor, len(visible), page_size=page_size)
+            index = start + visible_index
+            if start <= index < end and index < len(visible):
+                cursor = index
+                candidate_id = str(visible[cursor].get("id") or "")
+                if candidate_id in selected_ids:
+                    selected_ids.remove(candidate_id)
+                elif candidate_id:
+                    selected_ids.append(candidate_id)
+
+
 def wizard_apply_tooling_selection(
     manifest: Dict[str, Any],
     project_applied: bool,
@@ -5162,7 +5406,7 @@ def wizard_review_globals(manifest: Dict[str, Any], project_applied: bool) -> bo
     matched_candidates = conversation_matched_global_candidates(manifest)
     wizard_tooling_progress(
         progress_lines,
-        f"Ready: {summary['used']} conversation-matched action(s), {summary['total']} total discovered.",
+        f"Ready: {len(matched_candidates)} selectable conversation-matched action(s), {summary['total']} total discovered.",
     )
     print_tooling_summary_header()
     print()
@@ -5170,7 +5414,7 @@ def wizard_review_globals(manifest: Dict[str, Any], project_applied: bool) -> bo
         print("Detected from selected conversations:")
         print("These were actually used in the Claude sessions you selected.")
         print(
-            f"Found {summary['used']} carryover action(s): "
+            f"Found {summary['used']} used candidate(s), {len(matched_candidates)} selectable here: "
             f"{summary['used_plugins']} plugin(s), {summary['used_skills']} skill(s), "
             f"{summary['used_mcps']} MCP(s)."
         )
@@ -5192,18 +5436,13 @@ def wizard_review_globals(manifest: Dict[str, Any], project_applied: bool) -> bo
 
     if matched_candidates:
         print()
-        for index, candidate in enumerate(matched_candidates[:8], start=1):
-            print(f"  {index}. {tooling_candidate_line(candidate)}")
-        if len(matched_candidates) > 8:
-            print(f"  - +{len(matched_candidates) - 8} more")
         additional = summary["total"] - len(matched_candidates)
         if additional > 0:
-            print()
-            print(f"Expand to full Claude setup: {additional} additional candidate(s) not seen in selected conversations.")
+            print(f"Expand to full Claude setup: {additional} additional candidate(s) outside this picker.")
             print("Use this if you want Codex to feel closer to your full Claude environment.")
         print("Project-only records this in AGENTS.md/manifest without touching ~/.codex.")
         print("Install for this Codex user writes under ~/.codex and is available in every Codex project for this user.")
-        action, selected = wizard_select_matched_tooling(matched_candidates)
+        action, selected = matched_tooling_picker(manifest, matched_candidates, additional_count=additional)
     else:
         prompt = "\nExpand to full Claude setup? [y/N] "
         answer = wizard_answer(prompt, "n")

@@ -1124,6 +1124,8 @@ class AiHandoffTests(unittest.TestCase):
         self.assertEqual(self.module.normalize_menu_key("u"), "clear-visible")
         self.assertEqual(self.module.normalize_menu_key("C"), "clear-all")
         self.assertEqual(self.module.normalize_menu_key("i"), "invert-visible")
+        self.assertEqual(self.module.normalize_menu_key("e"), "expand")
+        self.assertEqual(self.module.normalize_menu_key("s"), "skip")
         self.assertEqual(self.module.normalize_menu_key("8"), "toggle:8")
 
     def test_interactive_menu_marks_cursor(self) -> None:
@@ -1284,14 +1286,9 @@ class AiHandoffTests(unittest.TestCase):
             encoding="utf-8",
         )
         manifest = self.module.build_manifest(str(self.project), last=1)
-        prompts = []
         stdout = io.StringIO()
 
-        def fake_answer(prompt: str, default: str = "") -> str:
-            prompts.append(prompt)
-            return "n"
-
-        with mock.patch.object(self.module, "wizard_answer", side_effect=fake_answer):
+        with mock.patch.object(self.module, "read_menu_key", return_value="skip"):
             with contextlib.redirect_stdout(stdout):
                 continued = self.module.wizard_review_globals(manifest, project_applied=False)
 
@@ -1304,20 +1301,20 @@ class AiHandoffTests(unittest.TestCase):
         self.assertIn("Detected from selected conversations", stdout.getvalue())
         self.assertIn("Captured from Claude setup", stdout.getvalue())
         self.assertIn("Expand to full Claude setup", stdout.getvalue())
-        self.assertEqual(
-            prompts,
-            ["\nSelect conversation-detected carryover [Enter=all/1,3/e expand full setup/s skip/q] "],
-        )
+        self.assertIn("Choose Conversation-Detected Carryover", stdout.getvalue())
+        self.assertIn("[x] skill:sample-skill", stdout.getvalue())
+        self.assertIn("e expand full setup", stdout.getvalue())
 
     def test_wizard_tooling_project_only_records_matched_actions(self) -> None:
         self.append_transcript_usage_events()
         manifest = self.module.build_manifest(str(self.project), last=1)
         stdout = io.StringIO()
-        answers = iter(["all", "project-only"])
+        answers = iter(["project-only"])
 
         with mock.patch.object(self.module, "wizard_answer", side_effect=lambda *args: next(answers)):
-            with contextlib.redirect_stdout(stdout):
-                continued = self.module.wizard_review_globals(manifest, project_applied=False)
+            with mock.patch.object(self.module, "read_menu_key", return_value="apply"):
+                with contextlib.redirect_stdout(stdout):
+                    continued = self.module.wizard_review_globals(manifest, project_applied=False)
 
         self.assertTrue(continued)
         self.assertIn("Recorded selected tooling", stdout.getvalue())
@@ -1329,14 +1326,33 @@ class AiHandoffTests(unittest.TestCase):
         self.append_transcript_usage_events()
         manifest = self.module.build_manifest(str(self.project), last=1)
         stdout = io.StringIO()
-        answers = iter(["1", "project-only"])
+        answers = iter(["project-only"])
+        keys = iter(["clear-all", "toggle:1", "apply"])
 
         with mock.patch.object(self.module, "wizard_answer", side_effect=lambda *args: next(answers)):
-            with contextlib.redirect_stdout(stdout):
-                continued = self.module.wizard_review_globals(manifest, project_applied=False)
+            with mock.patch.object(self.module, "read_menu_key", side_effect=lambda: next(keys)):
+                with contextlib.redirect_stdout(stdout):
+                    continued = self.module.wizard_review_globals(manifest, project_applied=False)
 
         self.assertTrue(continued)
         self.assertEqual(len(manifest["selected_global_action_ids"]), 1)
+
+    def test_matched_tooling_picker_renders_checkboxes(self) -> None:
+        self.append_transcript_usage_events()
+        manifest = self.module.build_manifest(str(self.project), last=1)
+        candidates = self.module.conversation_matched_global_candidates(manifest)
+
+        rendered = self.module.render_matched_tooling_picker(
+            manifest,
+            candidates,
+            selected_ids=[],
+            additional_count=2,
+        )
+
+        self.assertIn("Choose Conversation-Detected Carryover", rendered)
+        self.assertIn("[ ]", rendered)
+        self.assertIn("Expand to full Claude setup: 2 additional candidate(s) outside this picker", rendered)
+        self.assertIn("Space/x toggle", rendered)
 
     def test_tooling_progress_static_draw_clears_viewport(self) -> None:
         stdout = io.StringIO()
