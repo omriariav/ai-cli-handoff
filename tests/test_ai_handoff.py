@@ -1258,7 +1258,8 @@ class AiHandoffTests(unittest.TestCase):
         self.assertFalse(continued)
         rendered = stdout.getvalue()
         self.assertTrue(rendered.startswith(self.module.ANSI_CLEAR_VIEWPORT))
-        self.assertIn("Step 1/3: Claude Context", rendered)
+        self.assertIn("Step 1/4: Claude Context", rendered)
+        self.assertIn(f"Project: {self.project.resolve()}", rendered)
 
     def test_wizard_project_files_step_clears_previous_step_in_static_mode(self) -> None:
         manifest = self.module.build_manifest(str(self.project), last=1)
@@ -1273,7 +1274,23 @@ class AiHandoffTests(unittest.TestCase):
         self.assertFalse(applied)
         rendered = stdout.getvalue()
         self.assertTrue(rendered.startswith(self.module.ANSI_CLEAR_VIEWPORT))
-        self.assertIn("Step 2/3: Project Files", rendered)
+        self.assertIn("Step 2/4: Project Files", rendered)
+        self.assertIn(f"Project: {self.project.resolve()}", rendered)
+
+    def test_wizard_project_files_step_queues_without_writing(self) -> None:
+        manifest = self.module.build_manifest(str(self.project), last=1)
+        stdout = io.StringIO()
+
+        with mock.patch.object(self.module, "wizard_answer", return_value="y"):
+            with contextlib.redirect_stdout(stdout):
+                continued, selected = self.module.wizard_apply_project_files(manifest)
+
+        self.assertTrue(continued)
+        self.assertTrue(selected)
+        self.assertTrue(manifest["wizard_project_files_selected"])
+        self.assertIn("Queued project-local handoff files", stdout.getvalue())
+        self.assertFalse((self.project / "AGENTS.md").exists())
+        self.assertFalse((self.project / ".codex" / "handoff" / "manifest.json").exists())
 
     def test_wizard_shows_selected_conversations_after_picker(self) -> None:
         manifest = self.module.build_manifest(str(self.project), last=1)
@@ -1306,7 +1323,7 @@ class AiHandoffTests(unittest.TestCase):
                     continued = self.module.wizard_review_sessions(manifest)
 
         self.assertFalse(continued)
-        renders = stdout.getvalue().split("Step 1/3: Claude Context")
+        renders = stdout.getvalue().split("Step 1/4: Claude Context")
         self.assertEqual(len(renders), 3)
         self.assertIn("conversation 0", renders[2])
         self.assertIn("conversation 9", renders[2])
@@ -1337,7 +1354,8 @@ class AiHandoffTests(unittest.TestCase):
                 continued = self.module.wizard_review_globals(manifest, project_applied=False)
 
         self.assertTrue(continued)
-        self.assertIn("Step 3/3: Tooling & Claude Setup Carryover", stdout.getvalue())
+        self.assertIn("Step 3/4: Tooling & Claude Setup Carryover", stdout.getvalue())
+        self.assertIn(f"Project: {self.project.resolve()}", stdout.getvalue())
         self.assertIn("Scanning selected Claude conversations", stdout.getvalue())
         self.assertIn("Capturing Claude hooks, rules, references, and statusline", stdout.getvalue())
         self.assertIn("possible carryover action", stdout.getvalue())
@@ -1361,10 +1379,11 @@ class AiHandoffTests(unittest.TestCase):
                     continued = self.module.wizard_review_globals(manifest, project_applied=False)
 
         self.assertTrue(continued)
-        self.assertIn("Recorded selected tooling", stdout.getvalue())
+        self.assertIn("Queued selected tooling", stdout.getvalue())
         self.assertIn("skill:sample-skill", manifest["selected_global_action_ids"])
+        self.assertEqual(manifest["wizard_tooling_scope"], "project-only")
         self.assertFalse(manifest["global_apply_results"])
-        self.assertTrue((self.project / ".codex" / "handoff" / "manifest.json").exists())
+        self.assertFalse((self.project / ".codex" / "handoff" / "manifest.json").exists())
 
     def test_wizard_tooling_can_pick_matched_subset_by_number(self) -> None:
         self.append_transcript_usage_events()
@@ -1428,6 +1447,7 @@ class AiHandoffTests(unittest.TestCase):
         )
 
         self.assertIn("Choose Conversation-Detected Carryover", rendered)
+        self.assertIn(f"Project: {self.project.resolve()}", rendered)
         self.assertIn("[ ]", rendered)
         self.assertIn("Expand to full Claude setup: 2 additional candidate(s) outside this picker", rendered)
         self.assertIn("Space/x toggle", rendered)
@@ -1437,11 +1457,15 @@ class AiHandoffTests(unittest.TestCase):
 
         with mock.patch.object(self.module, "supports_static_menu", return_value=True):
             with contextlib.redirect_stdout(stdout):
-                self.module.draw_tooling_progress(["Scanning selected Claude conversations..."])
+                self.module.draw_tooling_progress(
+                    ["Scanning selected Claude conversations..."],
+                    project_path=str(self.project.resolve()),
+                )
 
         rendered = stdout.getvalue()
         self.assertTrue(rendered.startswith(self.module.ANSI_CLEAR_VIEWPORT))
-        self.assertIn("Step 3/3: Tooling & Claude Setup Carryover", rendered)
+        self.assertIn("Step 3/4: Tooling & Claude Setup Carryover", rendered)
+        self.assertIn(f"Project: {self.project.resolve()}", rendered)
         self.assertIn("[info] Scanning selected Claude conversations", rendered)
 
     def test_color_text_uses_ansi_only_when_supported(self) -> None:
@@ -1466,6 +1490,45 @@ class AiHandoffTests(unittest.TestCase):
 
         self.assertIn("GitHub source checked", line)
         self.assertIn("no native Codex plugin manifest", line)
+
+    def test_wizard_plan_review_applies_queued_project_files_and_tooling_record(self) -> None:
+        self.append_transcript_usage_events()
+        manifest = self.module.build_manifest(str(self.project), last=1)
+        selected = [
+            candidate
+            for candidate in self.module.global_action_candidates(manifest)
+            if candidate["id"] == "skill:sample-skill"
+        ]
+        self.module.set_selected_global_actions(manifest, ["skill:sample-skill"], selected)
+        manifest["wizard_tooling_scope"] = "project-only"
+        stdout = io.StringIO()
+
+        with mock.patch.object(self.module, "wizard_answer", return_value="y"):
+            with contextlib.redirect_stdout(stdout):
+                continued = self.module.wizard_review_plan_and_run(manifest, project_files_selected=True)
+
+        self.assertTrue(continued)
+        rendered = stdout.getvalue()
+        self.assertIn("Step 4/4: Review & Run Plan", rendered)
+        self.assertIn(f"Project: {self.project.resolve()}", rendered)
+        self.assertIn("Nothing has been written or installed yet.", rendered)
+        self.assertIn("Applied project-local handoff.", rendered)
+        self.assertIn("Tooling carryover recorded", rendered)
+        self.assertTrue((self.project / "AGENTS.md").exists())
+        written_manifest = self.module.load_json(self.project / ".codex" / "handoff" / "manifest.json")
+        self.assertEqual(written_manifest["selected_global_action_ids"], ["skill:sample-skill"])
+
+    def test_wizard_plan_review_can_quit_before_running(self) -> None:
+        manifest = self.module.build_manifest(str(self.project), last=1)
+        stdout = io.StringIO()
+
+        with mock.patch.object(self.module, "wizard_answer", return_value="q"):
+            with contextlib.redirect_stdout(stdout):
+                continued = self.module.wizard_review_plan_and_run(manifest, project_files_selected=True)
+
+        self.assertFalse(continued)
+        self.assertIn("Step 4/4: Review & Run Plan", stdout.getvalue())
+        self.assertFalse((self.project / "AGENTS.md").exists())
 
     def test_used_bridge_candidate_group_is_conversation_matched(self) -> None:
         group = self.module.global_candidate_group(
@@ -1544,6 +1607,7 @@ class AiHandoffTests(unittest.TestCase):
         )
 
         self.assertIn("Filter: testing", rendered)
+        self.assertIn(f"Project: {self.project.resolve()}", rendered)
         self.assertIn("Page: 1/1", rendered)
         self.assertIn("[x] Testing work", rendered)
         self.assertIn("--all-projects --search TEXT", rendered)
@@ -1560,6 +1624,7 @@ class AiHandoffTests(unittest.TestCase):
         )
 
         self.assertIn("View: plugin", rendered)
+        self.assertIn(f"Project: {self.project.resolve()}", rendered)
         self.assertIn("Filter: experimental", rendered)
         self.assertIn("[x] plugin:experimental@marketplace", rendered)
         self.assertIn("Manual / Unsafe:", rendered)

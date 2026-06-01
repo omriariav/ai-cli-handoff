@@ -3528,6 +3528,7 @@ def render_session_picker(
     lines = [
         "",
         "Choose Claude Conversations",
+        f"Project: {manifest['target_path']}",
         f"Selection: {sessions.get('selection_strategy')}",
         (
             f"Filter: {filter_text or 'none'} | "
@@ -4226,6 +4227,7 @@ def render_global_picker(
     lines = [
         "",
         title,
+        f"Project: {manifest['target_path']}",
         "Review everything configured in Claude, including tools not seen in the selected conversations.",
         "Installs run for this Codex user under ~/.codex and become available in every Codex project after final confirmation.",
         (
@@ -5030,7 +5032,8 @@ def wizard_review_sessions(manifest: Dict[str, Any]) -> bool:
         if supports_static_menu():
             sys.stdout.write(ANSI_CLEAR_VIEWPORT)
         sessions = manifest["claude"]["sessions"]
-        print(step_heading("Step 1/3", "Claude Context"))
+        print(step_heading("Step 1/4", "Claude Context"))
+        print(f"Project: {manifest['target_path']}")
         print(f"Selected {sessions.get('selected_count', 0)} of {sessions.get('found_count', 0)} discovered session(s).")
         selected_count = int(sessions.get("selected_count") or 0)
         if selected_count:
@@ -5063,12 +5066,13 @@ def wizard_apply_project_files(manifest: Dict[str, Any]) -> Tuple[bool, bool]:
     while True:
         if supports_static_menu():
             sys.stdout.write(ANSI_CLEAR_VIEWPORT)
-        print(step_heading("Step 2/3", "Project Files"))
-        print("Will write project-local handoff files only:")
+        print(step_heading("Step 2/4", "Project Files"))
+        print(f"Project: {manifest['target_path']}")
+        print("Project-local handoff files to include in the final plan:")
         for path in manifest["actions"].get("project_writes", []):
             print(f"  - {path}")
-        print("This does not change ~/.codex.")
-        answer = wizard_answer("Apply project-local files, preview diff, skip, or quit? [Y/p/s/q] ", "y")
+        print("This does not change ~/.codex and will not be written until the final review step.")
+        answer = wizard_answer("Include project-local files, preview diff, skip, or quit? [Y/p/s/q] ", "y")
         if answer in {"q", "quit"}:
             print("No more changes.")
             return False, False
@@ -5079,18 +5083,13 @@ def wizard_apply_project_files(manifest: Dict[str, Any]) -> Tuple[bool, bool]:
             print()
             continue
         if answer in {"s", "skip", "n", "no"}:
+            manifest["wizard_project_files_selected"] = False
             print("Project-local files skipped.")
             print()
             return True, False
-        if answer in {"y", "yes", "a", "apply"}:
-            try:
-                result = write_project_artifacts(manifest)
-            except HandoffError as exc:
-                print_handoff_error(exc, manifest["target_path"])
-                return False, False
-            print("Applied project-local handoff.")
-            for path in result["written"]:
-                print(f"  - {path}")
+        if answer in {"y", "yes", "a", "apply", "include"}:
+            manifest["wizard_project_files_selected"] = True
+            print("Queued project-local handoff files for final review.")
             print()
             return True, True
         print("Choose y, p, s, or q.")
@@ -5258,7 +5257,8 @@ def render_matched_tooling_picker(
     counts = tooling_picker_counts(candidates)
     lines = [
         "",
-        step_heading("Step 3/3", "Tooling & Claude Setup Carryover"),
+        step_heading("Step 3/4", "Tooling & Claude Setup Carryover"),
+        f"Project: {manifest['target_path']}",
         "",
         "Choose Conversation-Detected Carryover",
         "These tools were actually used in the Claude conversations you selected.",
@@ -5460,79 +5460,89 @@ def wizard_apply_tooling_selection(
             print("Stopped before tooling carryover.")
             return False
         if answer in {"project-only", "p", "record", "r", "yes", "y"}:
-            if not persist_wizard_tooling_state(manifest, project_applied):
-                return False
-            print("Recorded selected tooling in the project handoff; no ~/.codex changes were made.")
+            manifest["wizard_tooling_scope"] = "project-only"
+            print("Queued selected tooling for the final plan; no ~/.codex changes have been made.")
             return True
         if answer in {"i", "install", "user", "install-user"}:
-            if confirm_global_apply(manifest):
-                global_results = apply_selected_global_actions(manifest)
-                if not persist_wizard_tooling_state(manifest, project_applied):
-                    return False
-                print("Install results:")
-                for item in global_results:
-                    label = item.get("id")
-                    status = item.get("status")
-                    reason = item.get("reason")
-                    suffix = f" ({reason})" if reason else ""
-                    print(f"  - {label}: {status}{suffix}")
-            else:
-                if not persist_wizard_tooling_state(manifest, project_applied):
-                    return False
-                print("Selected tooling carryover actions were recorded in the project handoff; none were installed.")
+            manifest["wizard_tooling_scope"] = "install-user"
+            print("Queued selected tooling to install for this Codex user in the final plan.")
             return True
         print("Choose Enter, i, or q.")
 
 
-def render_tooling_progress(lines: List[str]) -> str:
-    rendered = [step_heading("Step 3/3", "Tooling & Claude Setup Carryover"), ""]
+def render_tooling_progress(lines: List[str], project_path: str = "") -> str:
+    rendered = [step_heading("Step 3/4", "Tooling & Claude Setup Carryover")]
+    if project_path:
+        rendered.append(f"Project: {project_path}")
+    rendered.append("")
     rendered.extend(f"  {color_text('[info]', ANSI_CYAN)} {line}" for line in lines)
     return "\n".join(rendered)
 
 
-def draw_tooling_progress(lines: List[str]) -> None:
+def draw_tooling_progress(lines: List[str], project_path: str = "") -> None:
     if supports_static_menu():
         sys.stdout.write(ANSI_CLEAR_VIEWPORT)
-    print(render_tooling_progress(lines), flush=True)
+    print(render_tooling_progress(lines, project_path=project_path), flush=True)
 
 
-def wizard_tooling_progress(lines: List[str], message: str) -> None:
+def wizard_tooling_progress(lines: List[str], message: str, project_path: str = "") -> None:
     lines.append(message)
     if supports_static_menu():
-        draw_tooling_progress(lines)
+        draw_tooling_progress(lines, project_path=project_path)
     else:
         print(f"  - {message}", flush=True)
 
 
-def wizard_github_progress(lines: List[str], index: int, total: int, candidate: Dict[str, Any]) -> None:
+def wizard_github_progress(lines: List[str], index: int, total: int, candidate: Dict[str, Any], project_path: str = "") -> None:
     if total <= 0:
         return
     if index == 1 or index == total or index % 5 == 0:
         repo = str(candidate.get("origin_github_repo") or "GitHub origin")
-        wizard_tooling_progress(lines, f"Checking GitHub/Codex compatibility {index}/{total}: {repo}")
+        wizard_tooling_progress(
+            lines,
+            f"Checking GitHub/Codex compatibility {index}/{total}: {repo}",
+            project_path=project_path,
+        )
 
 
-def print_tooling_summary_header() -> None:
+def print_tooling_summary_header(manifest: Dict[str, Any]) -> None:
     if supports_static_menu():
         sys.stdout.write(ANSI_CLEAR_VIEWPORT)
-    print(step_heading("Step 3/3", "Tooling & Claude Setup Carryover"))
+    print(step_heading("Step 3/4", "Tooling & Claude Setup Carryover"))
+    print(f"Project: {manifest['target_path']}")
 
 
 def wizard_review_globals(manifest: Dict[str, Any], project_applied: bool) -> bool:
     progress_lines: List[str] = []
-    draw_tooling_progress(progress_lines)
-    wizard_tooling_progress(progress_lines, "Scanning selected Claude conversations for MCP, skill, and plugin usage...")
-    wizard_tooling_progress(progress_lines, "Capturing Claude hooks, rules, references, and statusline configuration...")
+    project_path = str(manifest["target_path"])
+    draw_tooling_progress(progress_lines, project_path=project_path)
+    wizard_tooling_progress(
+        progress_lines,
+        "Scanning selected Claude conversations for MCP, skill, and plugin usage...",
+        project_path=project_path,
+    )
+    wizard_tooling_progress(
+        progress_lines,
+        "Capturing Claude hooks, rules, references, and statusline configuration...",
+        project_path=project_path,
+    )
     base_candidates = global_action_candidates(manifest)
     github_check_count = sum(1 for candidate in base_candidates if candidate.get("origin_github_repo"))
     wizard_tooling_progress(
         progress_lines,
         f"Found {len(base_candidates)} possible carryover action(s); "
-        f"{github_check_count} need GitHub/Codex compatibility checks."
+        f"{github_check_count} need GitHub/Codex compatibility checks.",
+        project_path=project_path,
     )
     all_candidates = annotate_github_codex_releases(
         base_candidates,
-        progress=lambda index, total, candidate: wizard_github_progress(progress_lines, index, total, candidate),
+        progress=lambda index, total, candidate: wizard_github_progress(
+            progress_lines,
+            index,
+            total,
+            candidate,
+            project_path=project_path,
+        ),
     )
     manifest["_display_global_action_candidates"] = all_candidates
     summary = wizard_global_candidate_summary(manifest)
@@ -5541,8 +5551,9 @@ def wizard_review_globals(manifest: Dict[str, Any], project_applied: bool) -> bo
     wizard_tooling_progress(
         progress_lines,
         f"Ready: {len(matched_candidates)} selectable conversation-matched action(s), {summary['total']} total discovered.",
+        project_path=project_path,
     )
-    print_tooling_summary_header()
+    print_tooling_summary_header(manifest)
     print()
     if summary["used"]:
         print("Detected from selected conversations:")
@@ -5579,6 +5590,8 @@ def wizard_review_globals(manifest: Dict[str, Any], project_applied: bool) -> bo
         if len(already_available) > 8:
             print(f"  - +{len(already_available) - 8} more")
     if summary["total"] == 0:
+        set_selected_global_actions(manifest, [], [])
+        manifest["wizard_tooling_scope"] = "skip"
         print("No tooling carryover actions found.")
         return True
 
@@ -5588,8 +5601,8 @@ def wizard_review_globals(manifest: Dict[str, Any], project_applied: bool) -> bo
         if additional > 0:
             print(f"Expand to full Claude setup: {additional} additional candidate(s) outside this picker.")
             print("Use this if you want Codex to feel closer to your full Claude environment.")
-        print("Project-only records this in AGENTS.md/manifest without touching ~/.codex.")
-        print("Install for this Codex user writes under ~/.codex and is available in every Codex project for this user.")
+        print("Project-only will record this in AGENTS.md/manifest during the final review, without touching ~/.codex.")
+        print("Install for this Codex user will write under ~/.codex during the final review and affect every Codex project for this user.")
         action, selected = matched_tooling_picker(manifest, matched_candidates, additional_count=additional)
     else:
         prompt = "\nExpand to full Claude setup? [y/N] "
@@ -5601,6 +5614,8 @@ def wizard_review_globals(manifest: Dict[str, Any], project_applied: bool) -> bo
         print("Stopped before tooling carryover.")
         return False
     if action in {"s", "skip", "n", "no"}:
+        set_selected_global_actions(manifest, [], [])
+        manifest["wizard_tooling_scope"] = "skip"
         print("Skipped tooling carryover.")
         return True
 
@@ -5613,25 +5628,158 @@ def wizard_review_globals(manifest: Dict[str, Any], project_applied: bool) -> bo
         print("Choose Enter, numbers, e, s, or q.")
         return wizard_review_globals(manifest, project_applied)
 
-    if not selected_global_candidates(manifest):
+    selected = selected_global_candidates(manifest)
+    if not selected:
+        set_selected_global_actions(manifest, [], [])
+        manifest["wizard_tooling_scope"] = "skip"
         print("No tooling carryover actions selected.")
         return True
-    if confirm_global_apply(manifest):
-        global_results = apply_selected_global_actions(manifest)
-        if not persist_wizard_tooling_state(manifest, project_applied):
-            return False
-        print("Install results:")
-        for item in global_results:
-            label = item.get("id")
-            status = item.get("status")
-            reason = item.get("reason")
-            suffix = f" ({reason})" if reason else ""
-            print(f"  - {label}: {status}{suffix}")
+    return wizard_apply_tooling_selection(manifest, project_applied, selected)
+
+
+def wizard_tooling_scope_label(scope: str) -> str:
+    if scope == "install-user":
+        return "install for this Codex user under ~/.codex"
+    if scope == "project-only":
+        return "record in project handoff only"
+    return "skip"
+
+
+def render_wizard_plan(manifest: Dict[str, Any], project_files_selected: bool) -> str:
+    sessions = manifest["claude"]["sessions"]
+    selected_global = selected_global_candidates(manifest)
+    scope = str(manifest.get("wizard_tooling_scope") or ("project-only" if selected_global else "skip"))
+    already_available = already_available_conversation_tools(manifest)
+    setup_counts = setup_capture_summary(manifest)
+    lines = [
+        step_heading("Step 4/4", "Review & Run Plan"),
+        f"Project: {manifest['target_path']}",
+        "",
+        "Nothing has been written or installed yet.",
+        "",
+        "Plan:",
+        f"  - Flow: {(manifest.get('flow') or {}).get('label') or 'Claude Code -> Codex'}",
+        (
+            f"  - Claude context: {sessions.get('selected_count', 0)} of "
+            f"{sessions.get('found_count', 0)} conversation(s) selected"
+        ),
+    ]
+    if project_files_selected:
+        lines.append("  - Project files: write/update")
+        for path in manifest["actions"].get("project_writes", []):
+            lines.append(f"      {path}")
     else:
+        lines.append("  - Project files: skipped")
+    if selected_global:
+        lines.append(
+            f"  - Tooling carryover: {len(selected_global)} selected, "
+            f"{wizard_tooling_scope_label(scope)}"
+        )
+        for candidate in selected_global[:8]:
+            lines.append(f"      {global_action_display_name(candidate)}")
+        if len(selected_global) > 8:
+            lines.append(f"      +{len(selected_global) - 8} more")
+    else:
+        lines.append("  - Tooling carryover: none selected")
+    if already_available:
+        lines.append(f"  - Already available for this Codex user: {len(already_available)} conversation-used tool(s)")
+    lines.append(
+        "  - Captured Claude setup: "
+        f"{setup_counts['hooks']} hook(s), {setup_counts['rules']} rule(s), "
+        f"{setup_counts['references']} reference(s), {setup_counts['statusline']} statusline config(s)"
+    )
+    if selected_global and scope == "install-user":
+        lines.extend(
+            [
+                "",
+                "User-level install warning:",
+                "  Selected tooling can change ~/.codex and become available in every Codex project for this OS user.",
+                "  Blocked/manual imports will be skipped and reported.",
+            ]
+        )
+    lines.extend(
+        [
+            "",
+            "Artifacts after run:",
+        ]
+    )
+    if project_files_selected:
+        for path in manifest["actions"].get("project_writes", []):
+            lines.append(f"  - {path}")
+    elif selected_global:
+        lines.append("  - .codex/handoff/manifest.json")
+        lines.append(f"  - .codex/handoff/runs/{manifest['run_id']}.json")
+    else:
+        lines.append("  - none")
+    return "\n".join(lines)
+
+
+def print_global_results(global_results: List[Dict[str, Any]]) -> None:
+    print("Install results:")
+    for item in global_results:
+        label = item.get("id")
+        status = item.get("status")
+        reason = item.get("reason")
+        suffix = f" ({reason})" if reason else ""
+        print(f"  - {label}: {status}{suffix}")
+
+
+def execute_wizard_plan(manifest: Dict[str, Any], project_files_selected: bool) -> bool:
+    selected_global = selected_global_candidates(manifest)
+    scope = str(manifest.get("wizard_tooling_scope") or ("project-only" if selected_global else "skip"))
+    project_applied = False
+
+    if project_files_selected:
+        try:
+            result = write_project_artifacts(manifest)
+        except HandoffError as exc:
+            print_handoff_error(exc, manifest["target_path"])
+            return False
+        project_applied = True
+        print("Applied project-local handoff.")
+        for path in result["written"]:
+            print(f"  - {path}")
+    else:
+        manifest["wizard_project_files_selected"] = False
+        print("Project-local files: skipped.")
+
+    if selected_global:
+        if scope == "install-user":
+            global_results = apply_selected_global_actions(manifest)
+            print_global_results(global_results)
+        else:
+            manifest["global_apply_results"] = []
+            print("Tooling carryover recorded for project handoff only; no ~/.codex changes were made.")
         if not persist_wizard_tooling_state(manifest, project_applied):
             return False
-        print("Selected tooling carryover actions were recorded in the project handoff; none were installed.")
+        if not project_applied:
+            print("Wrote tooling selection manifest.")
+            print("  - .codex/handoff/manifest.json")
+            print(f"  - .codex/handoff/runs/{manifest['run_id']}.json")
+    elif not project_applied:
+        print("No changes selected.")
     return True
+
+
+def wizard_review_plan_and_run(manifest: Dict[str, Any], project_files_selected: bool) -> bool:
+    while True:
+        if supports_static_menu():
+            sys.stdout.write(ANSI_CLEAR_VIEWPORT)
+        print(render_wizard_plan(manifest, project_files_selected))
+        answer = wizard_answer("\nRun this handoff plan, preview diff, or quit? [Y/p/q] ", "y")
+        if answer in {"q", "quit"}:
+            print("No plan executed.")
+            return False
+        if answer in {"p", "preview", "diff"}:
+            diff = render_diff(manifest, include_manifest=True)
+            print()
+            print(diff or "No project-local diff.")
+            print()
+            continue
+        if answer in {"y", "yes", "run", "a", "apply"}:
+            print()
+            return execute_wizard_plan(manifest, project_files_selected)
+        print("Choose y, p, or q.")
 
 
 def print_wizard_completion(manifest: Dict[str, Any]) -> None:
@@ -5644,6 +5792,7 @@ def print_wizard_completion(manifest: Dict[str, Any]) -> None:
     selected_global = manifest.get("selected_global_actions") or []
     print()
     print("AI handoff wizard complete.")
+    print(f"Project: {manifest['target_path']}")
     print(f"Confidence: {confidence.get('level', 'unknown')} - {confidence.get('reason', '')}")
     print(f"Claude context: {sessions.get('selected_count', 0)} of {sessions.get('found_count', 0)} conversation(s) selected.")
     if any(usage_kind_count(usage_summary, kind) for kind in ("mcp_servers", "skills", "plugins")):
@@ -5687,10 +5836,12 @@ def wizard_flow(manifest: Dict[str, Any]) -> int:
         return 0
     if not wizard_review_sessions(manifest):
         return 0
-    continue_flow, project_applied = wizard_apply_project_files(manifest)
+    continue_flow, project_files_selected = wizard_apply_project_files(manifest)
     if not continue_flow:
         return 0
-    if not wizard_review_globals(manifest, project_applied):
+    if not wizard_review_globals(manifest, project_applied=False):
+        return 0
+    if not wizard_review_plan_and_run(manifest, project_files_selected):
         return 0
     print_wizard_completion(manifest)
     return 0
