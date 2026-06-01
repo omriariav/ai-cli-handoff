@@ -1219,6 +1219,21 @@ class AiHandoffTests(unittest.TestCase):
         self.assertEqual(manifest["flow"]["id"], "claude_to_codex")
         self.assertEqual(prompts, ["\nChoose handoff flow [1/q] "])
 
+    def test_wizard_flow_step_clears_existing_terminal_in_static_mode(self) -> None:
+        manifest = self.module.build_manifest(str(self.project), last=1)
+        stdout = io.StringIO()
+
+        with mock.patch.object(self.module, "supports_static_menu", return_value=True):
+            with mock.patch.object(self.module, "wizard_answer", return_value="1"):
+                with contextlib.redirect_stdout(stdout):
+                    continued = self.module.wizard_select_flow(manifest)
+
+        self.assertTrue(continued)
+        rendered = stdout.getvalue()
+        self.assertTrue(rendered.startswith(self.module.ANSI_CLEAR_VIEWPORT))
+        self.assertIn("Flow: Handoff Direction", rendered)
+        self.assertIn(f"Project: {self.project.resolve()}", rendered)
+
     def test_wizard_flow_rejects_reverse_direction_for_now(self) -> None:
         manifest = self.module.build_manifest(str(self.project), last=1)
         stdout = io.StringIO()

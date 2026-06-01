@@ -4990,7 +4990,10 @@ def print_wizard_header(manifest: Dict[str, Any]) -> None:
 
 def wizard_select_flow(manifest: Dict[str, Any]) -> bool:
     while True:
+        if supports_static_menu():
+            sys.stdout.write(ANSI_CLEAR_VIEWPORT)
         print(step_heading("Flow", "Handoff Direction"))
+        print(f"Project: {manifest['target_path']}")
         print("  1. Claude Code -> Codex")
         print("     Prepare Codex from Claude conversations, CLAUDE.md, and Claude setup.")
         print("  2. Codex -> Claude Code")
