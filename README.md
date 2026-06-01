@@ -20,7 +20,7 @@ bin/ai-handoff diff /path/to/project
 
 `diff` shows human-facing write artifacts by default. Add `--include-manifest` to include manifest JSON. If Claude conversations or local MCP/skill/plugin inventory are selected, non-interactive apply requires `--ack-privacy` because the manifest can contain Claude-derived prompts, commands, inventories, and local paths.
 
-Project-local apply writes `AGENTS.md` plus `.codex/handoff/` artifacts:
+Project-local apply writes `AGENTS.md` plus `.codex/handoff/` artifacts. `AGENTS.md` is the Codex-loaded project instruction file, so the managed handoff section lists every selected Claude conversation and summarizes any Codex-wide tooling prepared by the run:
 
 ```bash
 bin/ai-handoff apply /path/to/project --yes --ack-privacy
@@ -47,7 +47,9 @@ Claude plugin records without a local cache remain manual. A Claude marketplace 
 
 `globals` groups candidates as Recommended, Review, and Manual/Unsafe. Low-confidence plugin records are hidden by default; add `--include-risky` to inspect them. `globals select` records intent only in `.codex/handoff/manifest.json`; it does not write `AGENTS.md` and does not install Codex-wide changes. `--select` accepts exact candidate IDs, skill names, type aliases such as `skills` or `mcps`, and `all`; bulk selectors skip unsafe/Codex-wide candidates unless `--include-risky` is present.
 
-Selected Claude transcripts are scanned for actual tooling usage. `ai-handoff` records observed `Skill` invocations, `mcp__server__tool` calls, skill metadata, and Claude plugin attribution, then marks matching Codex-wide candidates as `used-in-transcripts`. The wizard defaults to reviewing transcript-used Codex-wide actions when any exist; the picker opens in `used` view and `Tab` reviews all discovered candidates.
+Selected Claude transcripts are scanned for actual tooling usage. `ai-handoff` records observed `Skill` invocations, `mcp__server__tool` calls, skill metadata, and Claude plugin attribution, then marks matching Codex-wide candidates as `used-in-transcripts`. The wizard defaults to reviewing conversation-matched Codex-wide actions when any exist; the picker opens in `used` view and `Tab` reviews the broader discovered inventory. If you choose more conversations in step 1, the transcript usage and Codex-wide relevance are refreshed before step 3.
+
+The wizard completion screen prints what increased handoff confidence: selected conversation count, Claude tooling seen, project files written, Codex-wide installs completed or recorded, and the artifact paths to inspect.
 
 In the interactive conversation picker, use `/` to filter, `f`/`b` to page, `d` for details, and Space or row numbers to toggle visible sessions. Enter commits the draft selection; `q` cancels it.
 

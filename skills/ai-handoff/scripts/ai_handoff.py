@@ -2421,10 +2421,11 @@ def build_diagnostics(manifest: Dict[str, Any]) -> List[Dict[str, Any]]:
     return diagnostics
 
 
-def session_bullets(manifest: Dict[str, Any], limit: int = 5, include_private: bool = False) -> List[str]:
+def session_bullets(manifest: Dict[str, Any], limit: Optional[int] = 5, include_private: bool = False) -> List[str]:
     sessions = manifest["claude"]["sessions"].get("selected", [])
     bullets = []
-    for session in sessions[:limit]:
+    shown_sessions = sessions if limit is None else sessions[:limit]
+    for session in shown_sessions:
         title = truncate(str(session.get("title") or "Untitled"), 120)
         modified = session.get("modified") or session.get("created") or "unknown time"
         bullets.append(f"- {title} ({modified})")
@@ -2444,6 +2445,45 @@ def session_bullets(manifest: Dict[str, Any], limit: int = 5, include_private: b
         if commands:
             bullets.append(f"  Commands seen: {truncate('; '.join(commands[:3]), 260)}")
     return bullets
+
+
+def global_action_display_name(action: Dict[str, Any]) -> str:
+    action_id = str(action.get("id") or action.get("name") or "unknown")
+    if action.get("type") == "plugin" and action.get("bridge_name"):
+        return f"{action_id} bridged as {action.get('bridge_name')}"
+    if action.get("type") == "skill" and action.get("name"):
+        return f"{action_id} copied as {action.get('name')}"
+    return action_id
+
+
+def codex_tooling_status_lines(manifest: Dict[str, Any]) -> List[str]:
+    selected_actions = [
+        item for item in manifest.get("selected_global_actions") or [] if isinstance(item, dict)
+    ]
+    actions_by_id = {str(item.get("id")): item for item in selected_actions if item.get("id")}
+    results = [item for item in manifest.get("global_apply_results") or [] if isinstance(item, dict)]
+    ok_results = [item for item in results if item.get("status") == "ok"]
+    skipped_results = [item for item in results if item.get("status") and item.get("status") != "ok"]
+    lines: List[str] = []
+    if ok_results:
+        lines.append("- Installed Codex-wide for future Codex sessions:")
+        for result in ok_results:
+            action = actions_by_id.get(str(result.get("id")), {"id": result.get("id")})
+            lines.append(f"  - {global_action_display_name(action)}")
+        lines.append("- Open a new Codex session after Codex-wide plugin or skill installs.")
+    elif selected_actions:
+        lines.append("- Selected Codex-wide actions were recorded but not installed:")
+        for action in selected_actions:
+            lines.append(f"  - {global_action_display_name(action)}")
+    else:
+        lines.append("- No Codex-wide MCP, plugin, or skill installs were executed by this run.")
+    if skipped_results:
+        lines.append("- Skipped/manual Codex-wide actions:")
+        for result in skipped_results:
+            reason = str(result.get("reason") or "manual follow-up required")
+            lines.append(f"  - {result.get('id')}: {reason}")
+    lines.append("- Full install details are in .codex/handoff/manifest.json.")
+    return lines
 
 
 def render_summary(manifest: Dict[str, Any]) -> str:
@@ -2468,7 +2508,11 @@ def render_summary(manifest: Dict[str, Any]) -> str:
         f"- Sessions found: {sessions.get('found_count', 0)}",
         f"- Sessions selected: {sessions.get('selected_count', 0)}",
     ]
-    bullets = session_bullets(manifest, include_private=bool(manifest["selection"].get("include_transcript_excerpts")))
+    bullets = session_bullets(
+        manifest,
+        limit=None,
+        include_private=bool(manifest["selection"].get("include_transcript_excerpts")),
+    )
     lines.extend(bullets if bullets else ["- No recent Claude sessions selected."])
     usage_summary = sessions.get("usage_summary") or {}
     if any(usage_kind_count(usage_summary, kind) for kind in ("mcp_servers", "skills", "plugins")):
@@ -2502,6 +2546,8 @@ def render_summary(manifest: Dict[str, Any]) -> str:
             f"- Plugin records: {plugin_count} discovered, disabled by default",
         ]
     )
+    lines.extend(["", "## Codex Tooling Prepared"])
+    lines.extend(codex_tooling_status_lines(manifest))
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -2512,6 +2558,7 @@ def render_agents_managed_section(manifest: Dict[str, Any]) -> str:
         "# Codex Handoff Context",
         "",
         "This section is managed by ai-handoff. Keep durable project rules outside the managed markers.",
+        "Codex loads AGENTS.md automatically when it works in this project; use this managed section as handoff context before starting work.",
         "",
         f"Generated: {manifest['generated_at']}",
         f"Source project: {manifest['target_path']}",
@@ -2527,7 +2574,12 @@ def render_agents_managed_section(manifest: Dict[str, Any]) -> str:
     else:
         lines.append("- CLAUDE.md was not found.")
     lines.extend(["", "## Recent Claude Work"])
-    bullets = session_bullets(manifest, include_private=bool(manifest["selection"].get("include_transcript_excerpts")))
+    lines.append(f"- Selected sessions: {manifest['claude']['sessions'].get('selected_count', 0)} of {manifest['claude']['sessions'].get('found_count', 0)} discovered.")
+    bullets = session_bullets(
+        manifest,
+        limit=None,
+        include_private=bool(manifest["selection"].get("include_transcript_excerpts")),
+    )
     lines.extend(bullets if bullets else ["- No recent Claude sessions selected."])
     usage_summary = manifest["claude"]["sessions"].get("usage_summary") or {}
     if any(usage_kind_count(usage_summary, kind) for kind in ("mcp_servers", "skills", "plugins")):
@@ -2540,6 +2592,8 @@ def render_agents_managed_section(manifest: Dict[str, Any]) -> str:
                 f"- Plugins: {usage_kind_names(usage_summary, 'plugins')}",
             ]
         )
+    lines.extend(["", "## Codex Tooling Prepared"])
+    lines.extend(codex_tooling_status_lines(manifest))
     lines.extend(["", "## Commands Detected"])
     scripts = project.get("package_scripts") or {}
     if scripts:
@@ -2556,8 +2610,8 @@ def render_agents_managed_section(manifest: Dict[str, Any]) -> str:
             "- Latest manifest: .codex/handoff/manifest.json",
             "",
             "## Safety Notes",
-            "- Codex-wide MCP, plugin, and skill installs are disabled by default.",
-            "- Review Codex-wide install commands in the manifest before running them.",
+            "- Codex-wide MCP, plugin, and skill installs require explicit confirmation.",
+            "- Review Codex-wide install details in the manifest before running or changing them.",
             MANAGED_END,
         ]
     )
@@ -3073,6 +3127,12 @@ def update_session_selection(manifest: Dict[str, Any], selected_ids: List[str]) 
     sessions["selected"] = selected
     sessions["usage_summary"] = aggregate_session_usage(selected)
     sessions["selection_strategy"] = "user-selected conversations"
+    manifest["writes"] = project_write_metadata(manifest)
+    manifest["diagnostics"] = build_diagnostics(manifest)
+    manifest["global_candidates"] = global_action_candidates(manifest)
+    manifest["privacy"] = privacy_metadata(manifest)
+    manifest["handoff_confidence"] = handoff_confidence(manifest)
+    manifest.pop("_display_global_action_candidates", None)
 
 
 def session_picker(manifest: Dict[str, Any]) -> None:
@@ -4441,12 +4501,16 @@ def wizard_apply_project_files(manifest: Dict[str, Any]) -> Tuple[bool, bool]:
 
 def wizard_global_candidate_summary(manifest: Dict[str, Any]) -> Dict[str, int]:
     candidates = global_action_candidates(manifest)
+    used_candidates = [candidate for candidate in candidates if candidate.get("used_in_selected_sessions")]
     return {
         "total": len(candidates),
-        "used": sum(1 for candidate in candidates if candidate.get("used_in_selected_sessions")),
+        "used": len(used_candidates),
         "plugins": sum(1 for candidate in candidates if candidate.get("type") == "plugin"),
         "skills": sum(1 for candidate in candidates if candidate.get("type") == "skill"),
         "mcps": sum(1 for candidate in candidates if candidate.get("type") == "mcp"),
+        "used_plugins": sum(1 for candidate in used_candidates if candidate.get("type") == "plugin"),
+        "used_skills": sum(1 for candidate in used_candidates if candidate.get("type") == "skill"),
+        "used_mcps": sum(1 for candidate in used_candidates if candidate.get("type") == "mcp"),
     }
 
 
@@ -4454,17 +4518,30 @@ def wizard_review_globals(manifest: Dict[str, Any], project_applied: bool) -> bo
     summary = wizard_global_candidate_summary(manifest)
     print("Step 3/3: Codex-Wide Actions")
     print("These can change ~/.codex and affect every Codex project on this machine.")
-    print(
-        f"Found {summary['total']} candidate(s): {summary['plugins']} plugin(s), "
-        f"{summary['skills']} skill(s), {summary['mcps']} MCP(s)."
-    )
     if summary["used"]:
-        print(f"{summary['used']} candidate(s) were used in the selected Claude transcripts.")
+        print(
+            f"Found {summary['used']} conversation-matched candidate(s): "
+            f"{summary['used_plugins']} plugin(s), {summary['used_skills']} skill(s), "
+            f"{summary['used_mcps']} MCP(s)."
+        )
+        additional = summary["total"] - summary["used"]
+        if additional > 0:
+            print(f"{additional} additional candidate(s) from broader Claude inventory are available in the picker via Tab.")
+    else:
+        print("No MCP, skill, or plugin install candidates matched the selected Claude transcripts.")
+        print(
+            f"Broader Claude inventory has {summary['total']} candidate(s): "
+            f"{summary['plugins']} plugin(s), {summary['skills']} skill(s), {summary['mcps']} MCP(s)."
+        )
     if summary["total"] == 0:
         print("No Codex-wide actions found.")
         return True
     default = "y" if summary["used"] else "n"
-    prompt = "Review and choose Codex-wide actions now? [Y/n] " if default == "y" else "Review Codex-wide actions now? [y/N] "
+    prompt = (
+        "Review conversation-matched Codex-wide actions now? [Y/n] "
+        if default == "y"
+        else "Review broader Codex-wide inventory now? [y/N] "
+    )
     answer = wizard_answer(prompt, default)
     if answer in {"q", "quit"}:
         print("Stopped before Codex-wide actions.")
@@ -4494,8 +4571,63 @@ def wizard_review_globals(manifest: Dict[str, Any], project_applied: bool) -> bo
             suffix = f" ({reason})" if reason else ""
             print(f"  - {label}: {status}{suffix}")
     else:
+        try:
+            if project_applied:
+                write_project_artifacts(manifest)
+            else:
+                write_manifest_artifacts(manifest)
+        except HandoffError as exc:
+            print_handoff_error(exc, manifest["target_path"])
+            return False
         print("Selected Codex-wide actions were recorded in the manifest; none were executed.")
     return True
+
+
+def print_wizard_completion(manifest: Dict[str, Any]) -> None:
+    sessions = manifest["claude"]["sessions"]
+    confidence = manifest.get("handoff_confidence", {})
+    usage_summary = sessions.get("usage_summary") or {}
+    applied_actions = manifest.get("applied_actions") or []
+    global_results = [item for item in manifest.get("global_apply_results") or [] if isinstance(item, dict)]
+    ok_results = [item for item in global_results if item.get("status") == "ok"]
+    selected_global = manifest.get("selected_global_actions") or []
+    print()
+    print("AI handoff wizard complete.")
+    print(f"Confidence: {confidence.get('level', 'unknown')} - {confidence.get('reason', '')}")
+    print(f"Claude context: {sessions.get('selected_count', 0)} of {sessions.get('found_count', 0)} conversation(s) selected.")
+    if any(usage_kind_count(usage_summary, kind) for kind in ("mcp_servers", "skills", "plugins")):
+        print(
+            "Claude tooling seen: "
+            f"MCPs={usage_kind_names(usage_summary, 'mcp_servers')}; "
+            f"skills={usage_kind_names(usage_summary, 'skills')}; "
+            f"plugins={usage_kind_names(usage_summary, 'plugins')}."
+        )
+    if applied_actions:
+        print("Project files updated:")
+        for path in applied_actions:
+            print(f"  - {path}")
+    else:
+        print("Project files updated: none.")
+    if ok_results:
+        print("Codex-wide installs completed:")
+        actions_by_id = {
+            str(item.get("id")): item for item in selected_global if isinstance(item, dict) and item.get("id")
+        }
+        for result in ok_results:
+            action = actions_by_id.get(str(result.get("id")), {"id": result.get("id")})
+            print(f"  - {global_action_display_name(action)}")
+    elif selected_global:
+        print("Codex-wide installs selected but not executed:")
+        for action in selected_global:
+            if isinstance(action, dict):
+                print(f"  - {global_action_display_name(action)}")
+    else:
+        print("Codex-wide installs: none selected.")
+    print("Inspect:")
+    print(f"  - {shlex.quote(str(Path(manifest['target_path']) / 'AGENTS.md'))}")
+    print(f"  - {shlex.quote(str(Path(manifest['target_path']) / '.codex' / 'handoff' / 'summary.md'))}")
+    print(f"  - {shlex.quote(str(Path(manifest['target_path']) / '.codex' / 'handoff' / 'manifest.json'))}")
+    print(f"Next: cd {shlex.quote(manifest['target_path'])} && codex")
 
 
 def wizard_flow(manifest: Dict[str, Any]) -> int:
@@ -4507,9 +4639,7 @@ def wizard_flow(manifest: Dict[str, Any]) -> int:
         return 0
     if not wizard_review_globals(manifest, project_applied):
         return 0
-    print()
-    print("AI handoff wizard complete.")
-    print(f"Next: cd {shlex.quote(manifest['target_path'])} && codex")
+    print_wizard_completion(manifest)
     return 0
 
 
@@ -4533,8 +4663,31 @@ def load_latest_session_ids(project: Path) -> List[str]:
     return []
 
 
-def load_latest_global_action_ids(project: Path) -> List[str]:
+def has_global_handoff_state(data: Any) -> bool:
+    if not isinstance(data, dict):
+        return False
+    return bool(
+        data.get("selected_global_action_ids")
+        or data.get("selected_global_actions")
+        or data.get("global_apply_results")
+    )
+
+
+def load_latest_global_state(project: Path) -> Dict[str, Any]:
     data = load_json(latest_manifest_path(project))
+    if has_global_handoff_state(data):
+        return data
+    runs_dir = project / ".codex" / "handoff" / "runs"
+    if runs_dir.exists():
+        for path in sorted(runs_dir.glob("*.json"), key=lambda item: item.stat().st_mtime, reverse=True):
+            run_data = load_json(path)
+            if has_global_handoff_state(run_data):
+                return run_data
+    return data if isinstance(data, dict) else {}
+
+
+def load_latest_global_action_ids(project: Path) -> List[str]:
+    data = load_latest_global_state(project)
     ids = data.get("selected_global_action_ids") if isinstance(data, dict) else None
     if isinstance(ids, list):
         return [str(item) for item in ids if item]
@@ -4542,10 +4695,18 @@ def load_latest_global_action_ids(project: Path) -> List[str]:
 
 
 def load_latest_global_actions(project: Path) -> List[Dict[str, Any]]:
-    data = load_json(latest_manifest_path(project))
+    data = load_latest_global_state(project)
     actions = data.get("selected_global_actions") if isinstance(data, dict) else None
     if isinstance(actions, list):
         return [item for item in actions if isinstance(item, dict)]
+    return []
+
+
+def load_latest_global_apply_results(project: Path) -> List[Dict[str, Any]]:
+    data = load_latest_global_state(project)
+    results = data.get("global_apply_results") if isinstance(data, dict) else None
+    if isinstance(results, list):
+        return [item for item in results if isinstance(item, dict)]
     return []
 
 
@@ -4822,6 +4983,12 @@ def load_manifest_or_build(path: str) -> Tuple[Optional[Dict[str, Any]], int]:
             manifest["global_selection"] = saved["global_selection"]
         if saved.get("global_apply_results"):
             manifest["global_apply_results"] = saved["global_apply_results"]
+        if saved.get("applied"):
+            manifest["applied"] = True
+            manifest["applied_at"] = saved.get("applied_at")
+            manifest["applied_actions"] = [
+                str(item) for item in saved.get("applied_actions") or [] if item
+            ]
     return manifest, 0
 
 
@@ -5000,7 +5167,10 @@ def command_globals_apply(args: argparse.Namespace) -> int:
         return 0
     results = apply_selected_global_actions(manifest)
     try:
-        write_manifest_artifacts(manifest)
+        if manifest.get("applied"):
+            write_project_artifacts(manifest)
+        else:
+            write_manifest_artifacts(manifest)
     except HandoffError as exc:
         print_handoff_error(exc, manifest["target_path"])
         return 2
@@ -5091,6 +5261,7 @@ def command_apply(args: argparse.Namespace) -> int:
     selected_session_ids = parse_session_ids(getattr(args, "sessions", None)) or load_latest_session_ids(project)
     selected_global_action_ids = load_latest_global_action_ids(project)
     selected_global_actions = load_latest_global_actions(project)
+    global_apply_results = load_latest_global_apply_results(project)
     if args.yes:
         selection.update(
             {
@@ -5121,6 +5292,7 @@ def command_apply(args: argparse.Namespace) -> int:
         return validation_code
     manifest["selected_global_action_ids"] = selected_global_action_ids
     manifest["selected_global_actions"] = selected_global_actions
+    manifest["global_apply_results"] = global_apply_results
     if not args.yes and sys.stdin.isatty():
         print_dry_run(manifest)
         if not confirm_privacy_apply(manifest):

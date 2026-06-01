@@ -320,6 +320,22 @@ class AiHandoffTests(unittest.TestCase):
         self.assertIn("plugin:experimental@marketplace", stdout.getvalue())
         self.assertIn("used-in-transcripts", stdout.getvalue())
 
+    def test_session_selection_refreshes_tooling_relevance(self) -> None:
+        manifest = self.module.build_manifest(str(self.project), last=1)
+        plugin_before = next(
+            item for item in manifest["global_candidates"] if item["id"] == "plugin:experimental@marketplace"
+        )
+        self.assertFalse(plugin_before["used_in_selected_sessions"])
+
+        self.append_transcript_usage_events()
+        self.module.update_session_selection(manifest, ["session-1"])
+
+        plugin_after = next(
+            item for item in manifest["global_candidates"] if item["id"] == "plugin:experimental@marketplace"
+        )
+        self.assertTrue(plugin_after["used_in_selected_sessions"])
+        self.assertIn("Used in selected Claude transcript", plugin_after["why_relevant"])
+
     def test_claude_project_key_matches_dot_normalization(self) -> None:
         key = self.module.claude_project_key(Path("/Users/omri.a/Code/speech-to-text-tools"))
 
@@ -337,6 +353,85 @@ class AiHandoffTests(unittest.TestCase):
         agents = (self.project / "AGENTS.md").read_text(encoding="utf-8")
         self.assertIn(self.module.MANAGED_START, agents)
         self.assertIn("Testing work", agents)
+        self.assertIn("Codex loads AGENTS.md automatically", agents)
+        self.assertIn("No Codex-wide MCP, plugin, or skill installs were executed", agents)
+
+    def test_agents_lists_all_selected_conversations(self) -> None:
+        manifest = self.module.build_manifest(str(self.project), last=1)
+        base = dict(manifest["claude"]["sessions"]["selected"][0])
+        selected = []
+        for index in range(10):
+            item = dict(base)
+            item["session_id"] = f"session-{index}"
+            item["title"] = f"conversation {index}"
+            selected.append(item)
+        manifest["claude"]["sessions"]["selected"] = selected
+        manifest["claude"]["sessions"]["selected_count"] = len(selected)
+        manifest["claude"]["sessions"]["found_count"] = len(selected)
+        manifest["claude"]["sessions"]["selected_session_ids"] = [item["session_id"] for item in selected]
+
+        agents = self.module.render_agents_managed_section(manifest)
+
+        self.assertIn("Selected sessions: 10 of 10 discovered.", agents)
+        self.assertIn("conversation 0", agents)
+        self.assertIn("conversation 9", agents)
+
+    def test_agents_reports_installed_codex_wide_actions(self) -> None:
+        manifest = self.module.build_manifest(str(self.project), last=1)
+        manifest["selected_global_action_ids"] = ["plugin:x@omri-cc-stuff"]
+        manifest["selected_global_actions"] = [
+            {
+                "id": "plugin:x@omri-cc-stuff",
+                "type": "plugin",
+                "bridge_name": "cc-x",
+                "label": "bridge Claude plugin x",
+            }
+        ]
+        manifest["global_apply_results"] = [{"id": "plugin:x@omri-cc-stuff", "status": "ok"}]
+
+        agents = self.module.render_agents_managed_section(manifest)
+
+        self.assertIn("Installed Codex-wide for future Codex sessions", agents)
+        self.assertIn("plugin:x@omri-cc-stuff bridged as cc-x", agents)
+        self.assertIn("Open a new Codex session", agents)
+
+    def test_apply_preserves_prior_codex_wide_install_results(self) -> None:
+        manifest = self.module.build_manifest(str(self.project), last=1)
+        manifest["selected_global_action_ids"] = ["plugin:x@omri-cc-stuff"]
+        manifest["selected_global_actions"] = [
+            {"id": "plugin:x@omri-cc-stuff", "type": "plugin", "bridge_name": "cc-x"}
+        ]
+        manifest["global_apply_results"] = [{"id": "plugin:x@omri-cc-stuff", "status": "ok"}]
+        self.module.write_manifest_artifacts(manifest)
+
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            code = self.module.main(["apply", str(self.project), "--yes", "--ack-privacy"])
+
+        self.assertEqual(code, 0)
+        agents = (self.project / "AGENTS.md").read_text(encoding="utf-8")
+        self.assertIn("plugin:x@omri-cc-stuff bridged as cc-x", agents)
+
+    def test_apply_recovers_codex_wide_results_from_run_history(self) -> None:
+        manifest = self.module.build_manifest(str(self.project), last=1)
+        manifest["selected_global_action_ids"] = ["plugin:x@omri-cc-stuff"]
+        manifest["selected_global_actions"] = [
+            {"id": "plugin:x@omri-cc-stuff", "type": "plugin", "bridge_name": "cc-x"}
+        ]
+        manifest["global_apply_results"] = [{"id": "plugin:x@omri-cc-stuff", "status": "ok"}]
+        self.module.write_manifest_artifacts(manifest)
+
+        later = self.module.build_manifest(str(self.project), last=1)
+        later["run_id"] = "later-without-global-state"
+        self.module.write_manifest_artifacts(later)
+
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            code = self.module.main(["apply", str(self.project), "--yes", "--ack-privacy"])
+
+        self.assertEqual(code, 0)
+        agents = (self.project / "AGENTS.md").read_text(encoding="utf-8")
+        self.assertIn("plugin:x@omri-cc-stuff bridged as cc-x", agents)
 
     def test_cli_scan_json_outputs_manifest(self) -> None:
         stdout = io.StringIO()
@@ -1061,6 +1156,51 @@ class AiHandoffTests(unittest.TestCase):
         self.assertGreaterEqual(summary["plugins"], 1)
         self.assertGreaterEqual(summary["skills"], 1)
         self.assertGreaterEqual(summary["mcps"], 1)
+        self.assertIn("used_plugins", summary)
+
+    def test_wizard_globals_leads_with_conversation_matched_actions(self) -> None:
+        self.append_transcript_usage_events()
+        extra_skill = self.home / ".claude" / "skills" / "unused-skill"
+        extra_skill.mkdir()
+        (extra_skill / "SKILL.md").write_text(
+            "---\nname: unused-skill\ndescription: unused\n---\n",
+            encoding="utf-8",
+        )
+        manifest = self.module.build_manifest(str(self.project), last=1)
+        prompts = []
+        stdout = io.StringIO()
+
+        def fake_answer(prompt: str, default: str = "") -> str:
+            prompts.append(prompt)
+            return "n"
+
+        with mock.patch.object(self.module, "wizard_answer", side_effect=fake_answer):
+            with contextlib.redirect_stdout(stdout):
+                continued = self.module.wizard_review_globals(manifest, project_applied=False)
+
+        self.assertTrue(continued)
+        self.assertIn("conversation-matched candidate", stdout.getvalue())
+        self.assertIn("additional candidate(s) from broader Claude inventory", stdout.getvalue())
+        self.assertEqual(prompts, ["Review conversation-matched Codex-wide actions now? [Y/n] "])
+
+    def test_wizard_completion_lists_confidence_artifacts_and_installs(self) -> None:
+        manifest = self.module.build_manifest(str(self.project), last=1)
+        manifest["applied_actions"] = ["AGENTS.md", ".codex/handoff/summary.md"]
+        manifest["selected_global_actions"] = [
+            {"id": "plugin:x@omri-cc-stuff", "type": "plugin", "bridge_name": "cc-x"}
+        ]
+        manifest["global_apply_results"] = [{"id": "plugin:x@omri-cc-stuff", "status": "ok"}]
+        stdout = io.StringIO()
+
+        with contextlib.redirect_stdout(stdout):
+            self.module.print_wizard_completion(manifest)
+
+        rendered = stdout.getvalue()
+        self.assertIn("Confidence:", rendered)
+        self.assertIn("Project files updated:", rendered)
+        self.assertIn("AGENTS.md", rendered)
+        self.assertIn("Codex-wide installs completed:", rendered)
+        self.assertIn("plugin:x@omri-cc-stuff bridged as cc-x", rendered)
 
     def test_static_menu_draw_clears_viewport_when_supported(self) -> None:
         manifest = self.module.build_manifest(str(self.project), last=1)

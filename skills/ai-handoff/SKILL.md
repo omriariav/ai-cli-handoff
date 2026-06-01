@@ -31,13 +31,13 @@ bin/ai-handoff /path/to/project
 
 1. Resolve the target folder and verify it exists.
 2. Run the wizard for normal handoff work. It walks through Claude context, project-local files, then Codex-wide actions.
-3. In the Claude context step, keep the selected sessions, choose exact conversations, or skip Claude context.
+3. In the Claude context step, keep the selected sessions, choose more conversations, or skip Claude context. Changing the conversation selection must refresh transcript usage and Codex-wide candidate relevance before the Codex-wide step.
 4. In the project files step, preview the diff or apply project-local writes:
    - `AGENTS.md`
    - `.codex/handoff/summary.md`
    - `.codex/handoff/manifest.json`
    - `.codex/handoff/runs/<run-id>.json`
-5. In the Codex-wide step, review transcript-used actions first when any exist. Use the picker to select exact MCP, skill, and plugin installs; selection alone records intent and execution requires a second confirmation.
+5. In the Codex-wide step, lead with actions that match tooling used in the selected conversations. Use the picker to select exact MCP, skill, and plugin installs; selection alone records intent and execution requires a second confirmation. The broader Claude inventory remains available through picker views such as `all`.
    - In the conversation picker, use `/` filter, `f`/`b` page, `d` details, Space or row numbers to toggle, Enter to commit, and `q` to cancel draft changes.
    - In the Codex-wide install picker, use `/` filter, `Tab` view, `f`/`b` page, `d` details, `A` safe visible bulk-select, `u` clear visible, `C` clear all, `i` invert visible, and `?` help.
    - If no conversations are found, try `conversations --all-projects --search TEXT` or use `--from-claude-project KEY` from `doctor`/nearby match output.
@@ -49,7 +49,7 @@ bin/ai-handoff /path/to/project
    - Plugin bridge candidates inspect Claude marketplace metadata, known marketplace origins, local git remotes, and cached plugin paths. Mark `codex-native` when a local `.codex-plugin/plugin.json` exists. `globals` and the wizard review step check GitHub by default through authenticated `gh`; only mark `github-origin` after `gh` is installed/authenticated and performs a GitHub API check. If `gh` is missing, unauthenticated, or the API check fails, print a clear GitHub check failure and keep the bridge/manual fallback.
    - Claude plugin records without source or cache are manual by default; clearly report why the plugin cannot be prepared.
    - Non-interactive selection can be recorded with `ai-handoff globals select <path> --select ... --yes --ack-privacy`; execution remains a separate confirmation step.
-7. Mark the goal complete after the dry-run summary or apply artifacts have been produced.
+7. Mark the goal complete after the dry-run summary or apply artifacts have been produced. The completion screen should list selected conversation count, project files written, Codex-wide installs completed or recorded, and artifact paths to inspect.
 
 ## Commands
 
@@ -119,7 +119,7 @@ Codex-wide install filters:
 
 Candidate JSON includes `source_scope`, `risk`, `risk_badges`, `why_relevant`, `evidence`, `relevance_score`, `portable`, and `blocked_reason`. Plugin bridge candidates also include `bridge`, `bridge_name`, `bridge_source_path`, `bridge_destination_path`, `bridge_skill_count`, `bridge_agent_count`, `origin_github_repo`, `origin_source_url`, `codex_release_status`, `codex_release_evidence`, and `codex_release_check_urls`. Bulk selectors such as `all`, `skills`, and `plugins` skip `secret`, `unverified`, and Codex-wide candidates unless `--include-risky` is present. The internal `global-scope` badge is shown to users as `codex-wide`.
 
-Selected Claude transcripts are scanned for actual tooling usage. The CLI records observed `Skill` invocations, `mcp__server__tool` calls, skill metadata, and Claude plugin attribution in `claude.sessions.usage_summary`; matching Codex-wide candidates get `used_in_selected_sessions`, `transcript_usage`, high relevance evidence, and a `used-in-transcripts` marker in human output. The Codex-wide install picker should default to `used` view when such candidates exist; `all` remains available through `Tab`.
+Selected Claude transcripts are scanned for actual tooling usage. The CLI records observed `Skill` invocations, `mcp__server__tool` calls, skill metadata, and Claude plugin attribution in `claude.sessions.usage_summary`; matching Codex-wide candidates get `used_in_selected_sessions`, `transcript_usage`, high relevance evidence, and a `used-in-transcripts` marker in human output. The Codex-wide install picker should default to `used` view when such candidates exist; `all` remains available through `Tab`. Project artifacts should list every selected conversation, not only the first page/sample.
 
 The TTY conversation and Codex-wide install pickers must remain static in-place and must not use an alternate screen. Picker state is draft-only until Enter; `q` must leave prior selections unchanged. Selection state is ID-based, so filtering and paging cannot toggle the wrong conversation or install.
 
@@ -130,8 +130,8 @@ The TTY conversation and Codex-wide install pickers must remain static in-place 
 - Never copy Claude credentials, OAuth tokens, bearer tokens, or raw secrets.
 - Use `ai-handoff privacy <path>` when the user asks what may be written before apply.
 - Preserve existing `AGENTS.md`; update only the managed `ai-handoff` section unless the user explicitly asks for a replacement.
-- Do not run generated `codex mcp add` or `codex plugin add` commands without explicit user approval and `g`-selected items.
-- Do not bridge Claude plugins without explicit user approval and `g`-selected items.
+- Do not run generated `codex mcp add` or `codex plugin add` commands without explicit user approval and selected Codex-wide actions.
+- Do not bridge Claude plugins without explicit user approval and selected Codex-wide actions.
 - Do not treat `--yes` as permission to execute Codex-wide installs. It can only record project-local selection state.
 - Do not execute candidates with `blocked_reason`, `secret`, or `unverified` risk badges; report them as manual follow-up.
 - For OAuth MCPs, configure only the server command and tell the user to run `codex mcp login <name>`.
