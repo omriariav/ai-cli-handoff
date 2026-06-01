@@ -1,0 +1,10 @@
+#!/usr/bin/env python3
+"""Run the bundled ai-handoff CLI."""
+
+from pathlib import Path
+import runpy
+
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPT = ROOT / "skills" / "ai-handoff" / "scripts" / "ai_handoff.py"
+
+runpy.run_path(str(SCRIPT), run_name="__main__")
