@@ -1530,6 +1530,57 @@ class AiHandoffTests(unittest.TestCase):
         self.assertIn("Step 4/4: Review & Run Plan", stdout.getvalue())
         self.assertFalse((self.project / "AGENTS.md").exists())
 
+    def test_wizard_plan_install_user_requires_explicit_install(self) -> None:
+        self.append_transcript_usage_events()
+        manifest = self.module.build_manifest(str(self.project), last=1)
+        selected = [
+            candidate
+            for candidate in self.module.global_action_candidates(manifest)
+            if candidate["id"] == "skill:sample-skill"
+        ]
+        self.module.set_selected_global_actions(manifest, ["skill:sample-skill"], selected)
+        manifest["wizard_tooling_scope"] = "install-user"
+        stdout = io.StringIO()
+        prompts = []
+
+        def fake_answer(prompt: str, default: str = "") -> str:
+            prompts.append(prompt)
+            return ""
+
+        with mock.patch.object(self.module, "wizard_answer", side_effect=fake_answer):
+            with mock.patch.object(self.module, "apply_selected_global_actions") as apply_globals:
+                with contextlib.redirect_stdout(stdout):
+                    continued = self.module.wizard_review_plan_and_run(manifest, project_files_selected=True)
+
+        self.assertFalse(continued)
+        apply_globals.assert_not_called()
+        self.assertIn("Type install", prompts[0])
+        self.assertIn("No plan executed.", stdout.getvalue())
+        self.assertFalse((self.project / "AGENTS.md").exists())
+
+    def test_wizard_plan_preview_respects_skipped_project_files(self) -> None:
+        self.append_transcript_usage_events()
+        manifest = self.module.build_manifest(str(self.project), last=1)
+        selected = [
+            candidate
+            for candidate in self.module.global_action_candidates(manifest)
+            if candidate["id"] == "skill:sample-skill"
+        ]
+        self.module.set_selected_global_actions(manifest, ["skill:sample-skill"], selected)
+        manifest["wizard_tooling_scope"] = "project-only"
+        stdout = io.StringIO()
+        answers = iter(["p", "q"])
+
+        with mock.patch.object(self.module, "wizard_answer", side_effect=lambda *args: next(answers)):
+            with contextlib.redirect_stdout(stdout):
+                continued = self.module.wizard_review_plan_and_run(manifest, project_files_selected=False)
+
+        self.assertFalse(continued)
+        rendered = stdout.getvalue()
+        self.assertIn("--- a/.codex/handoff/manifest.json", rendered)
+        self.assertNotIn("--- a/AGENTS.md", rendered)
+        self.assertNotIn("--- a/.codex/handoff/summary.md", rendered)
+
     def test_used_bridge_candidate_group_is_conversation_matched(self) -> None:
         group = self.module.global_candidate_group(
             {
@@ -1563,6 +1614,24 @@ class AiHandoffTests(unittest.TestCase):
         self.assertIn("AGENTS.md", rendered)
         self.assertIn("Codex-wide installs completed:", rendered)
         self.assertIn("plugin:x@omri-cc-stuff bridged as cc-x", rendered)
+
+    def test_wizard_completion_lists_failed_install_results(self) -> None:
+        manifest = self.module.build_manifest(str(self.project), last=1)
+        manifest["selected_global_actions"] = [
+            {"id": "plugin:x@omri-cc-stuff", "type": "plugin", "bridge_name": "cc-x"}
+        ]
+        manifest["global_apply_results"] = [
+            {"id": "plugin:x@omri-cc-stuff", "status": "partial", "reason": "codex plugin add failed"}
+        ]
+        stdout = io.StringIO()
+
+        with contextlib.redirect_stdout(stdout):
+            self.module.print_wizard_completion(manifest)
+
+        rendered = stdout.getvalue()
+        self.assertIn("Codex-wide install results needing attention:", rendered)
+        self.assertIn("partial (codex plugin add failed)", rendered)
+        self.assertNotIn("selected but not executed", rendered)
 
     def test_static_menu_draw_clears_viewport_when_supported(self) -> None:
         manifest = self.module.build_manifest(str(self.project), last=1)

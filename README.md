@@ -1,80 +1,351 @@
 # AI CLI Handoff
 
-`ai-handoff` prepares a Claude Code project for Codex continuity.
+`ai-handoff` prepares a Claude Code project for work in Codex.
 
-The default flow is a one-time wizard:
+It is built for the moment when Claude Code context exists, Claude rate limits are gone, and you want Codex to continue from the same project reality instead of starting cold.
+
+The CLI reads the target folder, selected Claude Code conversations, `CLAUDE.md`, local Claude setup, and discovered MCP/skill/plugin usage. It then creates Codex-ready handoff artifacts such as `AGENTS.md` and `.codex/handoff/manifest.json`. Optional Codex user-level tooling carryover is reviewed separately and never runs by accident.
+
+Current version: `0.1.0`
+
+## Quick Start
+
+From this repository:
 
 ```bash
 bin/ai-handoff /path/to/project
 ```
 
-Inspect Claude conversations before applying:
+Installed as a Python package:
+
+```bash
+ai-handoff /path/to/project
+```
+
+Example:
+
+```bash
+bin/ai-handoff /Users/omri.a/Code/speech-to-text-tools
+```
+
+The default command opens a one-time wizard. It does not write files or install Codex-wide tooling until the final review step.
+
+## What It Does
+
+`ai-handoff` prepares a Claude Code project for Codex by:
+
+- Selecting recent Claude Code conversations, defaulting to the latest three relevant sessions.
+- Letting you choose more conversations with a static checkbox picker.
+- Summarizing recent Claude work into Codex-readable context.
+- Converting durable `CLAUDE.md` project guidance into a managed `AGENTS.md` section.
+- Writing `.codex/handoff/summary.md`, `.codex/handoff/manifest.json`, and run snapshots.
+- Detecting MCPs, Claude skills, Claude plugins, hooks, rules, references, and statusline settings.
+- Scanning selected transcripts for tooling that was actually used, not just installed somewhere.
+- Checking whether used Claude plugins already exist in Codex.
+- Checking GitHub origins for native Codex plugin metadata when `gh` is available and authenticated.
+- Proposing safe carryover paths: flag native Codex metadata for review, bridge from source, bridge from Claude cache, or report why manual work is required.
+
+## The Wizard
+
+The interactive flow is optimized for a one-time handoff.
+
+### Step 0: Handoff Direction
+
+Choose the flow:
+
+- `Claude Code -> Codex`: supported now.
+- `Codex -> Claude Code`: planned for later.
+
+Every step shows the current project folder so it is clear which repo is being prepared.
+
+### Step 1/4: Claude Context
+
+The wizard starts with the latest three relevant Claude Code conversations. You can continue, skip context, or choose more conversations.
+
+The conversation picker supports:
+
+- `/`: filter conversations.
+- `f` / `b`: page forward and back.
+- `d`: details.
+- Space or row numbers: toggle visible rows.
+- Enter: commit the draft selection.
+- `q`: cancel without changing the previous selection.
+
+If you select 10 of 10 conversations, the wizard shows the selected set instead of hiding it behind the original defaults.
+
+### Step 2/4: Project Files
+
+The wizard shows the project-local files that can be written:
+
+- `AGENTS.md`
+- `.codex/handoff/summary.md`
+- `.codex/handoff/manifest.json`
+- `.codex/handoff/runs/<run-id>.json`
+
+This step queues the project files only. It does not write them yet. You can preview the diff, include them in the final plan, skip them, or quit.
+
+### Step 3/4: Tooling & Claude Setup Carryover
+
+The wizard scans selected transcripts and leads with tooling that was actually used in those conversations. That keeps the main path relevant to the current project rather than dumping every global Claude plugin and skill on the machine.
+
+It also captures Claude setup that Codex should know about:
+
+- Hooks: captured for review only because they can run commands.
+- Rules: recorded and summarized for Codex.
+- References: paths are recorded; external references are not copied automatically.
+- Statusline: captured only because Codex does not currently use Claude statusline rendering.
+
+Conversation-detected tooling appears in a checkbox picker. By default, detected tools are selected unless they are already available in Codex.
+
+After choosing tools, you choose the scope:
+
+- Project-only: record selected carryover in the handoff artifacts. No `~/.codex` changes.
+- Install for this Codex user: queue user-level Codex installs under `~/.codex`.
+
+Step 3 still only queues intent. It does not write project files and does not install anything.
+
+### Step 4/4: Review & Run Plan
+
+The final screen summarizes the whole plan:
+
+- Project folder.
+- Handoff flow.
+- Selected conversation count.
+- Project files included or skipped.
+- Selected tooling and scope.
+- Already-available Codex tooling.
+- Captured Claude setup.
+- Artifact paths.
+
+You can preview the final diff, run, or quit.
+
+If the plan includes Codex user-level installs, Enter is not enough. You must type `install` because those actions can change `~/.codex` and affect every Codex project for the OS user.
+
+## Safety Model
+
+`ai-handoff` separates project-local writes from Codex user-level changes.
+
+Project-local writes:
+
+- Stay inside the target project.
+- Update only the managed `ai-handoff` section in `AGENTS.md`.
+- Write handoff artifacts under `.codex/handoff/`.
+- Are safe to inspect with `diff` before applying.
+
+Codex user-level changes:
+
+- Write under `~/.codex` or run `codex mcp add` / `codex plugin add`.
+- Affect every Codex project for that OS user.
+- Are never executed by the default scan.
+- Are never authorized by `--yes` alone.
+- Require explicit selection and final confirmation.
+- Require typing `install` in the wizard when user-level installs are queued.
+
+Privacy handling:
+
+- Claude prompts, summaries, commands, local paths, MCP names, skill names, plugin names, and nearby Claude project keys may be written to the manifest.
+- Secrets are best-effort redacted.
+- Non-interactive apply requires `--ack-privacy` when private Claude-derived context or local inventory may be persisted.
+- Use `privacy` before applying if you want a clear list of categories that may be written.
+
+```bash
+bin/ai-handoff privacy /path/to/project
+bin/ai-handoff diff /path/to/project --include-manifest
+```
+
+## Tooling Carryover
+
+Tooling carryover is deliberately conservative.
+
+### MCPs
+
+MCP candidates come from Claude configuration. Selected MCP imports run the corresponding `codex mcp add ...` command only after explicit user-level install approval. Commands containing redacted secrets are skipped and reported as manual follow-up.
+
+### Skills
+
+Claude skills can be copied into `~/.codex/skills` when selected. Existing Codex skill destinations are skipped rather than overwritten.
+
+### Plugins
+
+Claude plugin records are not assumed to be Codex plugins. In `0.1.0`, `ai-handoff` uses this order:
+
+1. Detect native Codex plugin metadata when the source repo exposes `.codex-plugin/plugin.json`, and surface that evidence for review.
+2. Bridge from the source repo at the Claude-used ref when available.
+3. If source resolution fails, bridge from the installed Claude cache as a labeled fallback.
+4. If neither source nor cache exists, report a manual action with the reason.
+
+For bridged plugins, `ai-handoff` writes `~/.codex/plugins/cc-<name>`, strips Claude-only runtime metadata, converts Claude commands into Codex-visible skills, converts Claude agents into Codex TOML agents, adds bridge metadata, updates the local marketplace registry, and then runs `codex plugin add cc-<name>@cc-bridged-plugins` only after explicit approval.
+
+GitHub origin checks are on by default for the wizard and `globals` listing. They require `gh` to be installed and authenticated. If `gh` is missing, unauthenticated, or the API check fails, the CLI says so and keeps the bridge/manual fallback visible.
+
+```bash
+bin/ai-handoff globals /path/to/project
+bin/ai-handoff globals /path/to/project --no-check-github
+```
+
+## Commands
+
+### Interactive
+
+```bash
+bin/ai-handoff /path/to/project
+```
+
+### Scan And Inspect
+
+```bash
+bin/ai-handoff scan /path/to/project
+bin/ai-handoff scan /path/to/project --json
+bin/ai-handoff diff /path/to/project
+bin/ai-handoff diff /path/to/project --include-manifest
+bin/ai-handoff privacy /path/to/project
+bin/ai-handoff doctor /path/to/project
+```
+
+### Conversations
 
 ```bash
 bin/ai-handoff conversations /path/to/project
-bin/ai-handoff conversations /path/to/project --all-projects --search speech
+bin/ai-handoff conversations /path/to/project --all-projects --search TEXT
 bin/ai-handoff scan /path/to/project --sessions session-1,session-7
-bin/ai-handoff privacy /path/to/project
-bin/ai-handoff diff /path/to/project
+bin/ai-handoff scan /path/to/project --from-claude-project -Users-you-Code-old-project
 ```
 
-`diff` shows human-facing write artifacts by default. Add `--include-manifest` to include manifest JSON. If Claude conversations or local MCP/skill/plugin inventory are selected, non-interactive apply requires `--ack-privacy` because the manifest can contain Claude-derived prompts, commands, inventories, and local paths.
+Useful filters:
 
-Project-local apply writes `AGENTS.md` plus `.codex/handoff/` artifacts. `AGENTS.md` is the Codex-loaded project instruction file, so the managed handoff section lists every selected Claude conversation and summarizes any Codex-wide tooling prepared by the run:
+- `--last N`: select the latest N sessions.
+- `--since 7d`: select sessions newer than a duration.
+- `--sessions id1,id2`: select exact sessions.
+- `--all-projects`: search across all Claude project folders.
+- `--from-claude-project KEY`: read from a specific Claude project key.
+- `--search TEXT`: filter by title, prompt, path, branch, or project key.
+- `--branch NAME`: filter by git branch.
+- `--include-transcripts`: include fuller redacted transcript excerpts.
+
+### Project-Local Apply
 
 ```bash
 bin/ai-handoff apply /path/to/project --yes --ack-privacy
 ```
 
-MCP, plugin, and skill installs are never executed by default. They install under `~/.codex`, so they are available in every Codex project for this OS user. The wizard first asks which Claude conversations to use, then applies project-local handoff files, then shows progress while it scans tooling and checks GitHub/native-Codex compatibility. Step 3 lists conversation-matched tooling with bridge reasons, lets you pick tools by number, then asks whether to record the carryover plan in the project handoff or install it for this Codex user after confirmation. Selected installs can also be executed later with:
+This writes project-local handoff files only. It does not install MCPs, skills, or plugins into `~/.codex`.
 
-Interactive TTY screens redraw in place while work is running. Color is enabled for TTY output unless `NO_COLOR` is set.
+### Codex User-Level Tooling
 
 ```bash
 bin/ai-handoff globals /path/to/project
 bin/ai-handoff globals /path/to/project --project-only
 bin/ai-handoff globals /path/to/project --portable-only
-bin/ai-handoff globals /path/to/project --check-github
-bin/ai-handoff globals /path/to/project --no-check-github
 bin/ai-handoff globals /path/to/project --include-risky
-bin/ai-handoff globals select /path/to/project --select skill:amq-cli,mcp:filesystem --yes --ack-privacy
+bin/ai-handoff globals select /path/to/project --select skill:name,mcp:name --yes --ack-privacy
 bin/ai-handoff globals apply /path/to/project
 ```
 
-MCP installs run selected `codex mcp add` commands. Skill installs copy selected Claude skill folders into `~/.codex/skills`, making them available to all Codex projects, when the destination does not already exist.
+`globals select` records intent in `.codex/handoff/manifest.json`. It does not write `AGENTS.md` and does not install anything. `globals apply` executes previously selected user-level actions after confirmation.
 
-Plugin records are handled in this order: use a directly installable native Codex package when the source repo exposes one; otherwise bridge from the source repo at the Claude-used ref when that source is available; otherwise fall back to the installed Claude cache and say so. A bridge copies the plugin into `~/.codex/plugins/cc-<name>`, strips Claude-only `hooks/`, `commands/`, and `agents/`, converts Claude commands into Codex-visible skills, converts `agents/*.md` into Codex TOML under `~/.codex/agents`, writes an `x-cc-bridge` marker, updates `~/.agents/plugins/marketplace.json`, and then runs `codex plugin add cc-<name>@cc-bridged-plugins` after explicit Codex-wide apply confirmation. GitHub origin checks are on by default for `globals` and the wizard review step. If `gh` is missing, unauthenticated, or the API check fails, the CLI prints a clear GitHub check failure and keeps the bridge/manual fallback. Use `--no-check-github` for a fully offline listing. After installing a bridged plugin, restart Codex or open a new session.
-
-Claude plugin records without a local cache remain manual. A Claude marketplace plugin is not automatically a Codex plugin; verify a Codex manifest/marketplace entry or bridge it first, for example with `cc2codex plugin-sync`. The embedded bridge behavior follows the MIT-licensed `cc-plugin-to-codex` model.
-
-`globals` groups candidates as Recommended, Review, and Manual/Unsafe. Low-confidence plugin records are hidden by default; add `--include-risky` to inspect them. `globals select` records intent only in `.codex/handoff/manifest.json`; it does not write `AGENTS.md` and does not install Codex-wide changes. `--select` accepts exact candidate IDs, skill names, type aliases such as `skills` or `mcps`, and `all`; bulk selectors skip unsafe/Codex-wide candidates unless `--include-risky` is present.
-
-Selected Claude transcripts are scanned for actual tooling usage. `ai-handoff` records observed `Skill` invocations, `mcp__server__tool` calls, skill metadata, and Claude plugin attribution, then marks matching carryover candidates as `used-in-transcripts`. If you choose more conversations in step 1, transcript usage and tooling relevance are refreshed before step 3. The detailed picker is only for Customize; it opens in `used` view when matching candidates exist, and `Tab` reviews the broader discovered inventory.
-
-The wizard completion screen prints what increased handoff confidence: selected conversation count, Claude tooling seen, project files written, Codex-wide installs completed or recorded, and the artifact paths to inspect.
-
-In the interactive conversation picker, use `/` to filter, `f`/`b` to page, `d` for details, and Space or row numbers to toggle visible sessions. Enter commits the draft selection; `q` cancels it.
-
-In the interactive Codex-wide install picker, use `/` to filter, `Tab` to cycle `used`/`all`/type views, `f`/`b` to page, `d` for details, `A` to select all safe visible candidates, `u` to clear visible candidates, `C` to clear all, `i` to invert safe visible candidates, and `?` for help. Bulk visible selection follows the same safety rules as `globals select`: risky, secret, unverified, blocked, and Codex-wide candidates are skipped unless selected explicitly.
-
-## Commands
+### History
 
 ```bash
-bin/ai-handoff conversations /path/to/project
-bin/ai-handoff diff /path/to/project
-bin/ai-handoff privacy /path/to/project
-bin/ai-handoff scan /path/to/project --json
-bin/ai-handoff conversations /path/to/project --all-projects --search TEXT
-bin/ai-handoff scan /path/to/project --from-claude-project -Users-you-Code-old-project
-bin/ai-handoff init /path/to/project
-bin/ai-handoff globals /path/to/project
-bin/ai-handoff globals /path/to/project --project-only
-bin/ai-handoff globals /path/to/project --portable-only
-bin/ai-handoff globals /path/to/project --no-check-github
-bin/ai-handoff globals select /path/to/project --select skills --yes --ack-privacy
-bin/ai-handoff globals apply /path/to/project
 bin/ai-handoff history /path/to/project
-bin/ai-handoff doctor /path/to/project
+bin/ai-handoff show <run-id> --path /path/to/project
 ```
 
-The Codex skill lives in `skills/ai-handoff`.
+## Generated Files
+
+`AGENTS.md`
+
+- Codex reads this automatically as project instructions.
+- `ai-handoff` updates only the managed section between markers.
+- Keep durable project rules outside the managed section.
+
+`.codex/handoff/summary.md`
+
+- Human-readable handoff summary.
+- Includes selected conversations, recent work, commands detected, and captured setup notes.
+
+`.codex/handoff/manifest.json`
+
+- Machine-readable audit trail.
+- Includes selected session IDs, transcript usage summaries, global tooling candidates, selected carryover, diagnostics, and privacy metadata.
+
+`.codex/handoff/runs/<run-id>.json`
+
+- Immutable run snapshot for history and debugging.
+
+## Installation
+
+For local development, no third-party runtime dependencies are required.
+
+```bash
+git clone https://github.com/omriariav/ai-cli-handoff.git
+cd ai-cli-handoff
+bin/ai-handoff --version
+```
+
+Install as a Python package:
+
+```bash
+python3 -m pip install .
+ai-handoff --version
+```
+
+Install the bundled Codex skill manually:
+
+```bash
+mkdir -p ~/.codex/skills/ai-handoff
+cp -R skills/ai-handoff/* ~/.codex/skills/ai-handoff/
+```
+
+## Development
+
+Run the test suite:
+
+```bash
+python3 -m unittest discover -s tests
+```
+
+Compile-check the bundled script and package implementation:
+
+```bash
+env PYTHONPYCACHEPREFIX=/private/tmp/ai-handoff-pyc \
+  python3 -m py_compile \
+  skills/ai-handoff/scripts/ai_handoff.py \
+  src/ai_handoff/handoff_impl.py \
+  tests/test_ai_handoff.py
+```
+
+The implementation is intentionally duplicated in two places:
+
+- `skills/ai-handoff/scripts/ai_handoff.py`
+- `src/ai_handoff/handoff_impl.py`
+
+Keep them in sync when editing. The package entry point imports `src/ai_handoff/handoff_impl.py`; the Codex skill and `bin/ai-handoff` use the bundled skill script.
+
+Validate the installed skill when updating skill docs or scripts:
+
+```bash
+python3 ~/.codex/skills/.system/skill-creator/scripts/quick_validate.py ~/.codex/skills/ai-handoff
+```
+
+## Release Checklist
+
+Version `0.1.0` is declared in:
+
+- `pyproject.toml`
+- `src/ai_handoff/__init__.py`
+- the CLI `--version` output
+
+Before tagging:
+
+```bash
+python3 -m unittest discover -s tests
+git status --short
+git tag -a v0.1.0 -m "ai-handoff 0.1.0"
+git push origin v0.1.0
+```
+
+Recommended order: merge the PR first, then tag the merge commit on `main`.
+
+## Status
+
+`0.1.0` is the first usable Claude Code -> Codex handoff release. The reverse `Codex -> Claude Code` flow is intentionally visible in the wizard but not implemented yet.

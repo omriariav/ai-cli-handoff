@@ -3086,6 +3086,17 @@ def plan_project_writes(manifest: Dict[str, Any]) -> List[Tuple[Path, str, str]]
     return planned
 
 
+def plan_manifest_writes(manifest: Dict[str, Any]) -> List[Tuple[Path, str, str]]:
+    project = Path(manifest["target_path"])
+    handoff_dir = project / ".codex" / "handoff"
+    runs_dir = handoff_dir / "runs"
+    data = json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+    return [
+        (handoff_dir / "manifest.json", data, ".codex/handoff/manifest.json"),
+        (runs_dir / f"{manifest['run_id']}.json", data, f".codex/handoff/runs/{manifest['run_id']}.json"),
+    ]
+
+
 def atomic_write_planned(planned: List[Tuple[Path, str, str]], run_id: str) -> List[str]:
     written = [relative for _, _, relative in planned]
     temp_paths: List[Path] = []
@@ -3110,14 +3121,7 @@ def atomic_write_planned(planned: List[Tuple[Path, str, str]], run_id: str) -> L
 
 
 def write_manifest_artifacts(manifest: Dict[str, Any]) -> Dict[str, Any]:
-    project = Path(manifest["target_path"])
-    handoff_dir = project / ".codex" / "handoff"
-    runs_dir = handoff_dir / "runs"
-    data = json.dumps(manifest, indent=2, sort_keys=True) + "\n"
-    planned = [
-        (handoff_dir / "manifest.json", data, ".codex/handoff/manifest.json"),
-        (runs_dir / f"{manifest['run_id']}.json", data, f".codex/handoff/runs/{manifest['run_id']}.json"),
-    ]
+    planned = plan_manifest_writes(manifest)
     written = atomic_write_planned(planned, str(manifest["run_id"]))
     return {"written": written, "manifest": manifest}
 
@@ -3133,13 +3137,9 @@ def write_project_artifacts(manifest: Dict[str, Any]) -> Dict[str, Any]:
     return {"written": written, "manifest": manifest}
 
 
-def render_diff(manifest: Dict[str, Any], include_manifest: bool = False) -> str:
+def render_planned_diff(planned: List[Tuple[Path, str, str]]) -> str:
     sections: List[str] = []
-    for target, content, relative in plan_project_writes(manifest):
-        if not include_manifest and (
-            relative == ".codex/handoff/manifest.json" or relative.startswith(".codex/handoff/runs/")
-        ):
-            continue
+    for target, content, relative in planned:
         old_text = read_text(target, 1_000_000)
         old_lines = [] if old_text is None else old_text.splitlines(keepends=True)
         new_lines = content.splitlines(keepends=True)
@@ -3154,6 +3154,26 @@ def render_diff(manifest: Dict[str, Any], include_manifest: bool = False) -> str
         if rendered:
             sections.append(rendered)
     return "\n\n".join(sections) + ("\n" if sections else "")
+
+
+def render_diff(manifest: Dict[str, Any], include_manifest: bool = False) -> str:
+    planned = []
+    for item in plan_project_writes(manifest):
+        _, _, relative = item
+        if not include_manifest and (
+            relative == ".codex/handoff/manifest.json" or relative.startswith(".codex/handoff/runs/")
+        ):
+            continue
+        planned.append(item)
+    return render_planned_diff(planned)
+
+
+def render_wizard_plan_diff(manifest: Dict[str, Any], project_files_selected: bool) -> str:
+    if project_files_selected:
+        return render_diff(manifest, include_manifest=True)
+    if selected_global_candidates(manifest):
+        return render_planned_diff(plan_manifest_writes(manifest))
+    return ""
 
 
 def print_dry_run(manifest: Dict[str, Any]) -> None:
@@ -5766,15 +5786,33 @@ def wizard_review_plan_and_run(manifest: Dict[str, Any], project_files_selected:
         if supports_static_menu():
             sys.stdout.write(ANSI_CLEAR_VIEWPORT)
         print(render_wizard_plan(manifest, project_files_selected))
-        answer = wizard_answer("\nRun this handoff plan, preview diff, or quit? [Y/p/q] ", "y")
+        selected_global = selected_global_candidates(manifest)
+        scope = str(manifest.get("wizard_tooling_scope") or ("project-only" if selected_global else "skip"))
+        needs_install_confirmation = bool(selected_global and scope == "install-user")
+        if needs_install_confirmation:
+            answer = wizard_answer(
+                "\nInstall selected tools for this Codex user now? Type install, preview diff, or quit. [install/p/q] ",
+                "",
+            )
+        else:
+            answer = wizard_answer("\nRun this handoff plan, preview diff, or quit? [Y/p/q] ", "y")
         if answer in {"q", "quit"}:
             print("No plan executed.")
             return False
         if answer in {"p", "preview", "diff"}:
-            diff = render_diff(manifest, include_manifest=True)
+            diff = render_wizard_plan_diff(manifest, project_files_selected)
             print()
             print(diff or "No project-local diff.")
             print()
+            continue
+        if needs_install_confirmation and answer in {"", "n", "no"}:
+            print("No plan executed.")
+            return False
+        if needs_install_confirmation:
+            if answer in {"install", "install-user"}:
+                print()
+                return execute_wizard_plan(manifest, project_files_selected)
+            print("Type install to change ~/.codex, p to preview, or q to quit.")
             continue
         if answer in {"y", "yes", "run", "a", "apply"}:
             print()
@@ -5816,8 +5854,21 @@ def print_wizard_completion(manifest: Dict[str, Any]) -> None:
         for result in ok_results:
             action = actions_by_id.get(str(result.get("id")), {"id": result.get("id")})
             print(f"  - {global_action_display_name(action)}")
+        problem_results = [item for item in global_results if item.get("status") != "ok"]
+        if problem_results:
+            print("Codex-wide install results needing attention:")
+            for result in problem_results:
+                reason = result.get("reason")
+                suffix = f" ({reason})" if reason else ""
+                print(f"  - {result.get('id')}: {result.get('status')}{suffix}")
+    elif global_results:
+        print("Codex-wide install results needing attention:")
+        for result in global_results:
+            reason = result.get("reason")
+            suffix = f" ({reason})" if reason else ""
+            print(f"  - {result.get('id')}: {result.get('status')}{suffix}")
     elif selected_global:
-        print("Codex-wide installs selected but not executed:")
+        print("Codex-wide installs recorded but not executed:")
         for action in selected_global:
             if isinstance(action, dict):
                 print(f"  - {global_action_display_name(action)}")
