@@ -11,6 +11,7 @@ import argparse
 import datetime as dt
 import difflib
 import hashlib
+import io
 import json
 import os
 import re
@@ -18,8 +19,10 @@ import shutil
 import shlex
 import subprocess
 import sys
+import tarfile
 import termios
 import textwrap
+import tempfile
 import tty
 import uuid
 from pathlib import Path
@@ -1012,9 +1015,18 @@ def installed_plugin_bridge_metadata(item: Dict[str, Any]) -> Dict[str, Any]:
     selector = str(item.get("name") or "")
     plugin_name, marketplace_name = plugin_selector_parts(selector)
     install_path = str(item.get("install_path") or "")
-    if not selector or not plugin_name or not install_path:
+    if not selector or not plugin_name:
         return {}
-    source_path = Path(install_path).expanduser()
+    cache_path = Path(install_path).expanduser() if install_path else None
+    origin_source_path = Path(str(item.get("origin_source_path") or "")).expanduser() if item.get("origin_source_path") else None
+    source_path = (
+        origin_source_path
+        if origin_source_path and (origin_source_path / ".claude-plugin" / "plugin.json").exists()
+        else cache_path
+    )
+    source_kind = "source-repo" if source_path and origin_source_path and source_path == origin_source_path else "claude-cache"
+    if not source_path:
+        return {}
     manifest = load_plugin_manifest(source_path)
     if not source_path.is_dir() or manifest is None:
         return {}
@@ -1026,11 +1038,15 @@ def installed_plugin_bridge_metadata(item: Dict[str, Any]) -> Dict[str, Any]:
         "bridge": True,
         "bridge_name": bridge_name,
         "bridge_source_path": str(source_path),
+        "bridge_cache_fallback_path": str(cache_path) if cache_path and cache_path != source_path else "",
         "bridge_destination_path": str(destination),
         "bridge_marketplace": marketplace_name,
         "bridge_source_plugin": plugin_name,
         "bridge_source_selector": selector,
-        "bridge_source_kind": "local",
+        "bridge_source_kind": source_kind,
+        "bridge_source_ref": str(item.get("origin_ref") or item.get("origin_sha") or item.get("git_commit_sha") or ""),
+        "bridge_source_subdir": str(item.get("origin_subdir") or ""),
+        "bridge_source_repo_root": str(item.get("origin_marketplace_root") or ""),
         "bridge_commit": str(item.get("git_commit_sha") or "local"),
         "bridge_version": str(item.get("version") or manifest.get("version") or ""),
         "bridge_plugin_description": str(manifest.get("description") or ""),
@@ -1330,91 +1346,167 @@ def write_bridge_registry(path: Path, registry: Dict[str, Any]) -> None:
     path.write_text(json.dumps(registry, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
+def safe_extract_tar_bytes(payload: bytes, destination: Path) -> None:
+    with tarfile.open(fileobj=io.BytesIO(payload), mode="r:*") as archive:
+        for member in archive.getmembers():
+            target = (destination / member.name).resolve()
+            if not path_is_within(target, destination):
+                raise HandoffError(f"refusing to extract unsafe archive member {member.name}")
+        archive.extractall(destination)
+
+
+def materialize_git_source_at_ref(repo_root: Path, ref: str, subdir: str) -> Tuple[Optional[tempfile.TemporaryDirectory], str]:
+    clean_subdir = subdir.strip("/")
+    if clean_subdir.startswith("./"):
+        clean_subdir = clean_subdir[2:]
+    if not repo_root.is_dir() or not ref or not clean_subdir:
+        return None, "missing source repo root, ref, or plugin subdir"
+    git_path = shutil.which("git") or "git"
+    treeish = f"{ref}:{clean_subdir}"
+    try:
+        proc = subprocess.run(
+            [git_path, "-C", str(repo_root), "archive", "--format=tar", treeish],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=30,
+        )
+    except Exception as exc:
+        return None, str(exc)
+    if proc.returncode != 0:
+        return None, compact(proc.stderr.decode("utf-8", errors="replace") or "git archive failed", 240)
+    temp_dir = tempfile.TemporaryDirectory(prefix="ai-handoff-plugin-")
+    destination = Path(temp_dir.name)
+    try:
+        safe_extract_tar_bytes(proc.stdout, destination)
+    except Exception as exc:
+        temp_dir.cleanup()
+        return None, str(exc)
+    if load_plugin_manifest(destination) is None:
+        temp_dir.cleanup()
+        return None, f"{treeish} does not contain a Claude or Codex plugin manifest"
+    return temp_dir, ""
+
+
 def bridge_plugin_to_codex(candidate: Dict[str, Any]) -> Dict[str, Any]:
-    source_path = Path(str(candidate.get("bridge_source_path") or "")).expanduser()
+    requested_source_path = Path(str(candidate.get("bridge_source_path") or "")).expanduser()
+    source_path = requested_source_path
     bridge_name = str(candidate.get("bridge_name") or "")
     source_plugin = str(candidate.get("bridge_source_plugin") or candidate.get("name") or "")
     source_selector = str(candidate.get("bridge_source_selector") or candidate.get("name") or "")
     marketplace = str(candidate.get("bridge_marketplace") or "")
     commit = str(candidate.get("bridge_commit") or "local")
+    source_kind = str(candidate.get("bridge_source_kind") or "claude-cache")
+    source_ref = str(candidate.get("bridge_source_ref") or "")
+    source_subdir = str(candidate.get("bridge_source_subdir") or "")
+    source_repo_root = Path(str(candidate.get("bridge_source_repo_root") or "")).expanduser()
+    cache_fallback_path = Path(str(candidate.get("bridge_cache_fallback_path") or "")).expanduser()
+    source_resolution = ""
+    temp_source: Optional[tempfile.TemporaryDirectory] = None
+    if source_kind == "source-repo" and source_ref and source_subdir and source_repo_root:
+        temp_source, source_resolution = materialize_git_source_at_ref(source_repo_root, source_ref, source_subdir)
+        if temp_source:
+            source_path = Path(temp_source.name)
+        elif cache_fallback_path.is_dir() and load_plugin_manifest(cache_fallback_path):
+            source_path = cache_fallback_path
+            source_kind = "claude-cache-fallback"
+        else:
+            raise HandoffError(f"source repo bridge failed: {source_resolution}")
     if not source_path.is_dir() or not bridge_name or not source_plugin:
         raise HandoffError("missing bridge source plugin metadata")
-    manifest = load_plugin_manifest(source_path)
-    if manifest is None:
-        raise HandoffError(f"missing .claude-plugin/plugin.json under {source_path}")
-
-    paths = codex_bridge_paths()
-    plugins_dir = paths["plugins_dir"]
-    agents_dir = paths["agents_dir"]
-    registry_path = paths["registry"]
-    bridge_dir = plugins_dir / bridge_name
-    manifest_path = bridge_dir / ".codex-plugin" / "plugin.json"
-    existing_marker = read_bridge_manifest_marker(manifest_path)
-    if manifest_path.exists() and existing_marker is None:
-        raise HandoffError(f"{manifest_path} exists and is not an ai-handoff bridge")
-    if existing_marker and existing_marker.get("source") != str(source_path):
-        raise HandoffError(f"{bridge_name} already exists from a different source")
-
-    synced_at = utc_now()
-    old_agents = list(existing_marker.get("agents") or []) if existing_marker else []
-    conversions = [
-        convert_bridge_agent(path, bridge_name=bridge_name, source_plugin=source_plugin, synced_at=synced_at)
-        for path in sorted((source_path / "agents").glob("*.md"))
-    ] if (source_path / "agents").is_dir() else []
-    new_agent_names = [str(item["agent_name"]) for item in conversions]
-    for conversion in conversions:
-        target = agents_dir / f"{conversion['agent_name']}.toml"
-        if target.exists() and read_bridge_agent_marker(target) is None:
-            raise HandoffError(f"{target} exists and is user-authored")
-
-    plugins_dir.mkdir(parents=True, exist_ok=True)
-    staged = plugins_dir / f".{bridge_name}.stage-{uuid.uuid4().hex[:8]}"
     try:
-        staged.mkdir(parents=True, exist_ok=False)
-        copy_bridge_plugin_body(source_path, staged)
-        command_skills = convert_bridge_commands(source_path, staged, source_plugin=source_plugin)
-        bridged_manifest = dict(manifest)
-        for key in BRIDGE_CC_ONLY_MANIFEST_KEYS:
-            bridged_manifest.pop(key, None)
-        bridged_manifest["name"] = bridge_name
-        bridged_manifest[BRIDGE_MARKER_KEY] = bridge_marker(
-            source_plugin=source_plugin,
-            source_selector=source_selector,
-            source_path=source_path,
-            marketplace=marketplace,
-            commit=commit,
-            agents=new_agent_names,
-            synced_at=synced_at,
-        )
-        bridged_manifest[BRIDGE_MARKER_KEY]["commands"] = command_skills
-        staged_manifest = staged / ".codex-plugin" / "plugin.json"
-        staged_manifest.parent.mkdir(parents=True, exist_ok=True)
-        staged_manifest.write_text(json.dumps(bridged_manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-        atomic_replace_dir(bridge_dir, staged)
-    except Exception:
-        shutil.rmtree(staged, ignore_errors=True)
-        raise
+        manifest = load_plugin_manifest(source_path)
+        if manifest is None:
+            raise HandoffError(f"missing .claude-plugin/plugin.json under {source_path}")
 
-    agents_dir.mkdir(parents=True, exist_ok=True)
-    for conversion in conversions:
-        (agents_dir / f"{conversion['agent_name']}.toml").write_text(str(conversion["toml"]), encoding="utf-8")
-    for stale in set(old_agents) - set(new_agent_names):
-        target = agents_dir / f"{stale}.toml"
-        if target.exists() and read_bridge_agent_marker(target) is not None:
-            target.unlink()
+        paths = codex_bridge_paths()
+        plugins_dir = paths["plugins_dir"]
+        agents_dir = paths["agents_dir"]
+        registry_path = paths["registry"]
+        bridge_dir = plugins_dir / bridge_name
+        manifest_path = bridge_dir / ".codex-plugin" / "plugin.json"
+        existing_marker = read_bridge_manifest_marker(manifest_path)
+        marker_source = str(requested_source_path)
+        if manifest_path.exists() and existing_marker is None:
+            raise HandoffError(f"{manifest_path} exists and is not an ai-handoff bridge")
+        if (
+            existing_marker
+            and existing_marker.get("source") not in {str(source_path), marker_source}
+            and existing_marker.get("sourceSelector") != source_selector
+        ):
+            raise HandoffError(f"{bridge_name} already exists from a different source")
 
-    registry = load_bridge_registry(registry_path)
-    upsert_bridge_registry_entry(registry, bridge_name)
-    write_bridge_registry(registry_path, registry)
-    return {
-        "bridge": bridge_name,
-        "source": str(source_path),
-        "destination": str(bridge_dir),
-        "manifest": str(manifest_path),
-        "registry": str(registry_path),
-        "agents": new_agent_names,
-        "commands": command_skills,
-    }
+        synced_at = utc_now()
+        old_agents = list(existing_marker.get("agents") or []) if existing_marker else []
+        conversions = [
+            convert_bridge_agent(path, bridge_name=bridge_name, source_plugin=source_plugin, synced_at=synced_at)
+            for path in sorted((source_path / "agents").glob("*.md"))
+        ] if (source_path / "agents").is_dir() else []
+        new_agent_names = [str(item["agent_name"]) for item in conversions]
+        for conversion in conversions:
+            target = agents_dir / f"{conversion['agent_name']}.toml"
+            if target.exists() and read_bridge_agent_marker(target) is None:
+                raise HandoffError(f"{target} exists and is user-authored")
+
+        plugins_dir.mkdir(parents=True, exist_ok=True)
+        staged = plugins_dir / f".{bridge_name}.stage-{uuid.uuid4().hex[:8]}"
+        try:
+            staged.mkdir(parents=True, exist_ok=False)
+            copy_bridge_plugin_body(source_path, staged)
+            command_skills = convert_bridge_commands(source_path, staged, source_plugin=source_plugin)
+            bridged_manifest = dict(manifest)
+            for key in BRIDGE_CC_ONLY_MANIFEST_KEYS:
+                bridged_manifest.pop(key, None)
+            bridged_manifest["name"] = bridge_name
+            bridged_manifest[BRIDGE_MARKER_KEY] = bridge_marker(
+                source_plugin=source_plugin,
+                source_selector=source_selector,
+                source_path=Path(marker_source),
+                marketplace=marketplace,
+                commit=commit,
+                agents=new_agent_names,
+                synced_at=synced_at,
+            )
+            bridged_manifest[BRIDGE_MARKER_KEY]["sourceKind"] = source_kind
+            resolved_source = str(source_path)
+            if source_kind == "source-repo" and source_ref:
+                resolved_source = f"{marker_source}@{source_ref}"
+            bridged_manifest[BRIDGE_MARKER_KEY]["resolvedSource"] = resolved_source
+            bridged_manifest[BRIDGE_MARKER_KEY]["commands"] = command_skills
+            if source_resolution:
+                bridged_manifest[BRIDGE_MARKER_KEY]["sourceResolution"] = source_resolution
+            staged_manifest = staged / ".codex-plugin" / "plugin.json"
+            staged_manifest.parent.mkdir(parents=True, exist_ok=True)
+            staged_manifest.write_text(json.dumps(bridged_manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+            atomic_replace_dir(bridge_dir, staged)
+        except Exception:
+            shutil.rmtree(staged, ignore_errors=True)
+            raise
+
+        agents_dir.mkdir(parents=True, exist_ok=True)
+        for conversion in conversions:
+            (agents_dir / f"{conversion['agent_name']}.toml").write_text(str(conversion["toml"]), encoding="utf-8")
+        for stale in set(old_agents) - set(new_agent_names):
+            target = agents_dir / f"{stale}.toml"
+            if target.exists() and read_bridge_agent_marker(target) is not None:
+                target.unlink()
+
+        registry = load_bridge_registry(registry_path)
+        upsert_bridge_registry_entry(registry, bridge_name)
+        write_bridge_registry(registry_path, registry)
+        return {
+            "bridge": bridge_name,
+            "source": str(source_path),
+            "source_kind": source_kind,
+            "source_resolution": source_resolution,
+            "destination": str(bridge_dir),
+            "manifest": str(manifest_path),
+            "registry": str(registry_path),
+            "agents": new_agent_names,
+            "commands": command_skills,
+        }
+    finally:
+        if temp_source:
+            temp_source.cleanup()
 
 
 def install_bridged_plugin(bridge_name: str) -> Dict[str, Any]:
@@ -2034,10 +2126,12 @@ def candidate_scope_and_risk(action_type: str, item: Dict[str, Any], project: Pa
             portable = False
             risk = "high"
             why_relevant = (
-                "Installed Claude plugin cache can be bridged into a Codex plugin "
-                "with skills and agent conversion."
+                "Claude plugin can be bridged into a Codex plugin with command, skill, and agent conversion."
             )
-            evidence = f"local Claude plugin cache: {bridge['bridge_source_path']}"
+            if bridge.get("bridge_source_kind") == "source-repo":
+                evidence = f"source repo plugin: {bridge['bridge_source_path']}"
+            else:
+                evidence = f"Claude installed cache fallback: {bridge['bridge_source_path']}"
             relevance_score = "medium"
             risk_badges.extend(["local-path", "bridge"])
             if str(origin.get("codex_release_status") or "").startswith("native-codex"):
@@ -3253,11 +3347,15 @@ def global_action_candidates(manifest: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "bridge": bool(item.get("bridge")),
                 "bridge_name": item.get("bridge_name"),
                 "bridge_source_path": item.get("bridge_source_path"),
+                "bridge_cache_fallback_path": item.get("bridge_cache_fallback_path"),
                 "bridge_destination_path": item.get("bridge_destination_path"),
                 "bridge_marketplace": item.get("bridge_marketplace"),
                 "bridge_source_plugin": item.get("bridge_source_plugin"),
                 "bridge_source_selector": item.get("bridge_source_selector"),
                 "bridge_source_kind": item.get("bridge_source_kind"),
+                "bridge_source_ref": item.get("bridge_source_ref"),
+                "bridge_source_subdir": item.get("bridge_source_subdir"),
+                "bridge_source_repo_root": item.get("bridge_source_repo_root"),
                 "bridge_commit": item.get("bridge_commit"),
                 "bridge_version": item.get("bridge_version"),
                 "bridge_skill_count": item.get("bridge_skill_count", 0),
@@ -3456,7 +3554,12 @@ def render_global_candidate_details(candidate: Dict[str, Any]) -> str:
         lines.append(f"Destination: {candidate['destination_path']}")
     if candidate.get("bridge"):
         lines.append(f"Bridge name: {candidate.get('bridge_name')}")
+        lines.append(f"Bridge source kind: {candidate.get('bridge_source_kind') or 'unknown'}")
         lines.append(f"Bridge source: {candidate.get('bridge_source_path')}")
+        if candidate.get("bridge_source_ref"):
+            lines.append(f"Bridge ref: {candidate.get('bridge_source_ref')}")
+        if candidate.get("bridge_cache_fallback_path"):
+            lines.append(f"Cache fallback: {candidate.get('bridge_cache_fallback_path')}")
         lines.append(f"Bridge destination: {candidate.get('bridge_destination_path')}")
         lines.append(f"Bridge skills: {candidate.get('bridge_skill_count', 0)}")
         lines.append(f"Bridge agents: {candidate.get('bridge_agent_count', 0)}")
@@ -3826,7 +3929,16 @@ def selected_global_candidates(manifest: Dict[str, Any]) -> List[Dict[str, Any]]
         ]
         if saved_candidates:
             saved_by_id = {str(item.get("id")): item for item in saved_candidates}
-            return [saved_by_id[action_id] for action_id in manifest.get("selected_global_action_ids") or [] if action_id in saved_by_id]
+            fresh_by_id = {
+                str(candidate.get("id")): candidate
+                for candidate in global_action_candidates(manifest)
+                if candidate.get("id") in selected_ids
+            }
+            return [
+                merge_saved_global_action(fresh_by_id.get(action_id, {}), saved_by_id[action_id])
+                for action_id in manifest.get("selected_global_action_ids") or []
+                if action_id in saved_by_id
+            ]
     if selected_ids:
         fresh = [candidate for candidate in global_action_candidates(manifest) if candidate["id"] in selected_ids]
         if fresh:
@@ -3834,6 +3946,20 @@ def selected_global_candidates(manifest: Dict[str, Any]) -> List[Dict[str, Any]]
     if isinstance(saved, list) and saved:
         return [item for item in saved if isinstance(item, dict) and item.get("type") in GLOBAL_ACTION_TYPES]
     return []
+
+
+def merge_saved_global_action(fresh: Dict[str, Any], saved: Dict[str, Any]) -> Dict[str, Any]:
+    if not fresh:
+        return dict(saved)
+    merged = dict(fresh)
+    for key, value in saved.items():
+        if key.startswith("github_codex_") or key in {
+            "codex_release_status",
+            "codex_release_evidence",
+            "global_apply_results",
+        }:
+            merged[key] = value
+    return merged
 
 
 def parse_csv(value: Optional[str]) -> List[str]:
@@ -3966,6 +4092,10 @@ def confirm_global_apply(manifest: Dict[str, Any]) -> bool:
                 print(f"    {truncate(str(candidate['label']), 160)}")
                 if detail:
                     print(f"    {truncate(detail, 160)}")
+                if candidate.get("bridge_source_kind"):
+                    source_kind = str(candidate.get("bridge_source_kind"))
+                    source_ref = str(candidate.get("bridge_source_ref") or candidate.get("bridge_commit") or "")
+                    print(f"    bridge source: {source_kind}" + (f" @ {source_ref[:12]}" if source_ref else ""))
                 if candidate.get("origin_source_url"):
                     print(f"    source: {truncate(str(candidate.get('origin_source_url')), 160)}")
                 if candidate.get("origin_github_repo"):
@@ -4221,6 +4351,163 @@ def interactive_flow(manifest: Dict[str, Any]) -> int:
         if static_menu:
             sys.stdout.write(ANSI_SHOW_CURSOR)
             sys.stdout.flush()
+
+
+def wizard_answer(prompt: str, default: str = "") -> str:
+    answer = input(prompt).strip().lower()
+    return answer or default
+
+
+def print_wizard_header(manifest: Dict[str, Any]) -> None:
+    sessions = manifest["claude"]["sessions"]
+    confidence = manifest.get("handoff_confidence", {})
+    print("AI Handoff Wizard")
+    print(f"Project: {manifest['target_path']}")
+    print(f"Confidence: {confidence.get('level', 'unknown')} - {confidence.get('reason', '')}")
+    print(
+        f"Claude sessions: {sessions.get('found_count', 0)} found, "
+        f"{sessions.get('selected_count', 0)} selected"
+    )
+    usage_summary = sessions.get("usage_summary") or {}
+    used_plugins = usage_kind_names(usage_summary, "plugins")
+    if used_plugins != "none":
+        print(f"Transcript-used plugins: {used_plugins}")
+    print()
+
+
+def wizard_review_sessions(manifest: Dict[str, Any]) -> bool:
+    while True:
+        sessions = manifest["claude"]["sessions"]
+        print("Step 1/3: Claude Context")
+        print(f"Selected {sessions.get('selected_count', 0)} of {sessions.get('found_count', 0)} discovered session(s).")
+        for bullet in session_bullets(manifest, limit=3):
+            print("  " + bullet)
+        answer = wizard_answer("Continue, choose conversations, skip context, or quit? [Enter/c/s/q] ", "continue")
+        if answer in {"q", "quit"}:
+            print("No files changed.")
+            return False
+        if answer in {"c", "choose", "conversations"}:
+            session_picker(manifest)
+            print()
+            continue
+        if answer in {"s", "skip"}:
+            update_session_selection(manifest, [])
+            print("Claude context skipped.")
+            print()
+            return True
+        if answer in {"continue", "y", "yes"}:
+            print()
+            return True
+        print("Choose Enter, c, s, or q.")
+
+
+def wizard_apply_project_files(manifest: Dict[str, Any]) -> Tuple[bool, bool]:
+    while True:
+        print("Step 2/3: Project Files")
+        print("Will write project-local handoff files only:")
+        for path in manifest["actions"].get("project_writes", []):
+            print(f"  - {path}")
+        print("This does not change ~/.codex.")
+        answer = wizard_answer("Apply project-local files, preview diff, skip, or quit? [Y/p/s/q] ", "y")
+        if answer in {"q", "quit"}:
+            print("No more changes.")
+            return False, False
+        if answer in {"p", "preview", "diff"}:
+            diff = render_diff(manifest, include_manifest=False)
+            print()
+            print(diff or "No project-local diff.")
+            print()
+            continue
+        if answer in {"s", "skip", "n", "no"}:
+            print("Project-local files skipped.")
+            print()
+            return True, False
+        if answer in {"y", "yes", "a", "apply"}:
+            try:
+                result = write_project_artifacts(manifest)
+            except HandoffError as exc:
+                print_handoff_error(exc, manifest["target_path"])
+                return False, False
+            print("Applied project-local handoff.")
+            for path in result["written"]:
+                print(f"  - {path}")
+            print()
+            return True, True
+        print("Choose y, p, s, or q.")
+
+
+def wizard_global_candidate_summary(manifest: Dict[str, Any]) -> Dict[str, int]:
+    candidates = global_action_candidates(manifest)
+    return {
+        "total": len(candidates),
+        "used": sum(1 for candidate in candidates if candidate.get("used_in_selected_sessions")),
+        "plugins": sum(1 for candidate in candidates if candidate.get("type") == "plugin"),
+        "skills": sum(1 for candidate in candidates if candidate.get("type") == "skill"),
+        "mcps": sum(1 for candidate in candidates if candidate.get("type") == "mcp"),
+    }
+
+
+def wizard_review_globals(manifest: Dict[str, Any], project_applied: bool) -> bool:
+    summary = wizard_global_candidate_summary(manifest)
+    print("Step 3/3: Codex-Wide Actions")
+    print("These can change ~/.codex and affect every Codex project on this machine.")
+    print(
+        f"Found {summary['total']} candidate(s): {summary['plugins']} plugin(s), "
+        f"{summary['skills']} skill(s), {summary['mcps']} MCP(s)."
+    )
+    if summary["used"]:
+        print(f"{summary['used']} candidate(s) were used in the selected Claude transcripts.")
+    if summary["total"] == 0:
+        print("No Codex-wide actions found.")
+        return True
+    default = "y" if summary["used"] else "n"
+    prompt = "Review and choose Codex-wide actions now? [Y/n] " if default == "y" else "Review Codex-wide actions now? [y/N] "
+    answer = wizard_answer(prompt, default)
+    if answer in {"q", "quit"}:
+        print("Stopped before Codex-wide actions.")
+        return False
+    if answer not in {"y", "yes", "r", "review"}:
+        print("Skipped Codex-wide actions.")
+        return True
+    global_picker(manifest)
+    if not selected_global_candidates(manifest):
+        print("No Codex-wide actions selected.")
+        return True
+    if confirm_global_apply(manifest):
+        global_results = apply_selected_global_actions(manifest)
+        try:
+            if project_applied:
+                write_project_artifacts(manifest)
+            else:
+                write_manifest_artifacts(manifest)
+        except HandoffError as exc:
+            print_handoff_error(exc, manifest["target_path"])
+            return False
+        print("Codex-wide install results:")
+        for item in global_results:
+            label = item.get("id")
+            status = item.get("status")
+            reason = item.get("reason")
+            suffix = f" ({reason})" if reason else ""
+            print(f"  - {label}: {status}{suffix}")
+    else:
+        print("Selected Codex-wide actions were recorded in the manifest; none were executed.")
+    return True
+
+
+def wizard_flow(manifest: Dict[str, Any]) -> int:
+    print_wizard_header(manifest)
+    if not wizard_review_sessions(manifest):
+        return 0
+    continue_flow, project_applied = wizard_apply_project_files(manifest)
+    if not continue_flow:
+        return 0
+    if not wizard_review_globals(manifest, project_applied):
+        return 0
+    print()
+    print("AI handoff wizard complete.")
+    print(f"Next: cd {shlex.quote(manifest['target_path'])} && codex")
+    return 0
 
 
 def latest_manifest_path(project: Path) -> Path:
@@ -4520,9 +4807,14 @@ def load_manifest_or_build(path: str) -> Tuple[Optional[Dict[str, Any]], int]:
             for item in saved.get("selected_global_actions") or []
             if isinstance(item, dict) and item.get("id") in set(selected_ids)
         ]
-        manifest["selected_global_actions"] = saved_actions or [
-            candidate for candidate in global_action_candidates(manifest) if candidate.get("id") in set(selected_ids)
-        ]
+        fresh_actions = [candidate for candidate in global_action_candidates(manifest) if candidate.get("id") in set(selected_ids)]
+        fresh_by_id = {str(item.get("id")): item for item in fresh_actions}
+        if saved_actions:
+            manifest["selected_global_actions"] = [
+                merge_saved_global_action(fresh_by_id.get(str(item.get("id")), {}), item) for item in saved_actions
+            ]
+        else:
+            manifest["selected_global_actions"] = fresh_actions
         if saved.get("global_selection"):
             manifest["global_selection"] = saved["global_selection"]
         if saved.get("global_apply_results"):
@@ -4749,7 +5041,7 @@ def command_scan(args: argparse.Namespace, *, default_interactive: bool = False)
         print(json.dumps(manifest, indent=2, sort_keys=True))
         return 0
     if default_interactive and sys.stdin.isatty() and not args.no_interactive:
-        return interactive_flow(manifest)
+        return wizard_flow(manifest)
     print_dry_run(manifest)
     return 0
 

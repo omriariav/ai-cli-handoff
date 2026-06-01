@@ -7,7 +7,7 @@ description: Prepare a Claude Code project for Codex handoff. Use when the user 
 
 ## Overview
 
-Use this skill to prepare a project folder for Codex using local Claude Code context. The bundled CLI scans `CLAUDE.md`, recent Claude Code sessions, local Claude settings, MCP candidates, skills, plugins, and Codex readiness; dry-run is default and apply writes project-local handoff artifacts only unless the user explicitly chooses Codex-wide install commands.
+Use this skill to prepare a project folder for Codex using local Claude Code context. The bundled CLI scans `CLAUDE.md`, recent Claude Code sessions, local Claude settings, MCP candidates, skills, plugins, and Codex readiness; the default human flow is a one-time wizard. Project-local handoff files are applied only after confirmation, and Codex-wide installs run only after a separate explicit confirmation.
 
 ## Quick Start
 
@@ -30,33 +30,31 @@ bin/ai-handoff /path/to/project
 ## Workflow
 
 1. Resolve the target folder and verify it exists.
-2. Run a dry-run scan first. Do not skip this unless the user explicitly requests apply mode.
-3. Review the project-local writes and discovered Codex-wide install candidates with the user.
-4. Use the interactive picker when the defaults are not enough:
-   - Press `c` or open the Claude context row to choose exact Claude conversations. The parent row is checked only when one or more sessions are selected.
-   - Press `g` or open the Codex-wide installs row to choose exact MCP, skill, and plugin installs. The parent row is checked only when one or more installs are selected, not merely discovered.
-   - In the conversation picker, use `/` filter, `f`/`b` page, `d` details, Space or row numbers to toggle, Enter to commit, and `q` to cancel draft changes.
-   - In the Codex-wide install picker, use `/` filter, `Tab` view, `f`/`b` page, `d` details, `A` safe visible bulk-select, `u` clear visible, `C` clear all, `i` invert visible, and `?` help.
-   - When selected transcripts contain tooling evidence, the Codex-wide install picker opens in `used` view. Press `Tab` to move from transcript-used installs to all discovered installs.
-   - If no conversations are found, try `conversations --all-projects --search TEXT` or use `--from-claude-project KEY` from `doctor`/nearby match output.
-5. Apply project-local writes when requested:
+2. Run the wizard for normal handoff work. It walks through Claude context, project-local files, then Codex-wide actions.
+3. In the Claude context step, keep the selected sessions, choose exact conversations, or skip Claude context.
+4. In the project files step, preview the diff or apply project-local writes:
    - `AGENTS.md`
    - `.codex/handoff/summary.md`
    - `.codex/handoff/manifest.json`
    - `.codex/handoff/runs/<run-id>.json`
+5. In the Codex-wide step, review transcript-used actions first when any exist. Use the picker to select exact MCP, skill, and plugin installs; selection alone records intent and execution requires a second confirmation.
+   - In the conversation picker, use `/` filter, `f`/`b` page, `d` details, Space or row numbers to toggle, Enter to commit, and `q` to cancel draft changes.
+   - In the Codex-wide install picker, use `/` filter, `Tab` view, `f`/`b` page, `d` details, `A` safe visible bulk-select, `u` clear visible, `C` clear all, `i` invert visible, and `?` help.
+   - If no conversations are found, try `conversations --all-projects --search TEXT` or use `--from-claude-project KEY` from `doctor`/nearby match output.
 6. Apply selected Codex-wide installs only after explicit confirmation. These can change `~/.codex` and affect every Codex project/folder on this machine:
    - MCP imports run selected `codex mcp add ...` commands.
    - Skill imports copy selected Claude skill folders into `~/.codex/skills`.
-   - Plugin imports with a local Claude install cache are bridged into `~/.codex/plugins/cc-<name>`, with Claude-only mechanisms stripped, agents converted to `~/.codex/agents/*.toml`, and `~/.agents/plugins/marketplace.json` updated. After explicit Codex-wide apply confirmation, bridged plugins must also run `codex plugin add cc-<name>@cc-bridged-plugins`; report a partial result if the bridge write succeeds but Codex install fails.
-   - Plugin bridge candidates inspect Claude marketplace metadata, known marketplace origins, local git remotes, and cached plugin paths. Mark `codex-native` when a local `.codex-plugin/plugin.json` exists. `globals` and the interactive `g` picker check GitHub by default through authenticated `gh`; only mark `github-origin` after `gh` is installed/authenticated and performs a GitHub API check. If `gh` is missing, unauthenticated, or the API check fails, print a clear GitHub check failure and keep the bridge/manual fallback.
-   - Claude plugin records without a local cache are manual by default; first verify a Codex manifest/marketplace entry or bridge them with a tool such as `cc2codex plugin-sync`.
+   - Plugin imports prefer directly installable native Codex support from the source repo. If no native Codex package exists, bridge from the source repo at the Claude-used ref; use the installed Claude cache only as an explicit fallback when source resolution fails.
+   - Bridged plugins are written into `~/.codex/plugins/cc-<name>`, Claude-only mechanisms are stripped, Claude commands become Codex-visible skills, agents are converted to `~/.codex/agents/*.toml`, `~/.agents/plugins/marketplace.json` is updated, and `codex plugin add cc-<name>@cc-bridged-plugins` is run. Report a partial result if the bridge write succeeds but Codex install fails.
+   - Plugin bridge candidates inspect Claude marketplace metadata, known marketplace origins, local git remotes, and cached plugin paths. Mark `codex-native` when a local `.codex-plugin/plugin.json` exists. `globals` and the wizard review step check GitHub by default through authenticated `gh`; only mark `github-origin` after `gh` is installed/authenticated and performs a GitHub API check. If `gh` is missing, unauthenticated, or the API check fails, print a clear GitHub check failure and keep the bridge/manual fallback.
+   - Claude plugin records without source or cache are manual by default; clearly report why the plugin cannot be prepared.
    - Non-interactive selection can be recorded with `ai-handoff globals select <path> --select ... --yes --ack-privacy`; execution remains a separate confirmation step.
 7. Mark the goal complete after the dry-run summary or apply artifacts have been produced.
 
 ## Commands
 
 ```bash
-# Interactive dry-run scan
+# Interactive wizard
 ai-handoff /path/to/project
 
 # Non-mutating scan
@@ -73,7 +71,7 @@ ai-handoff scan /path/to/project --from-claude-project -Users-you-Code-old-proje
 # Project-local apply; --yes never authorizes Codex-wide installs
 ai-handoff apply /path/to/project --yes --ack-privacy
 
-# Execute Codex-wide installs selected earlier with `g`
+# Advanced Codex-wide review/apply
 ai-handoff globals /path/to/project
 ai-handoff globals /path/to/project --project-only
 ai-handoff globals /path/to/project --portable-only

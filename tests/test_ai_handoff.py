@@ -557,10 +557,31 @@ class AiHandoffTests(unittest.TestCase):
         self.assertEqual(plugin["blocked_reason"], "")
         self.assertIn("bridge", plugin["risk_badges"])
         self.assertIn("codex-native", plugin["risk_badges"])
-        self.assertIn("local Claude plugin cache", plugin["evidence"])
+        self.assertIn("Claude installed cache fallback", plugin["evidence"])
         self.assertEqual(plugin["origin_github_repo"], "acme/demo-market")
         self.assertEqual(plugin["codex_release_status"], "native-codex-source")
         self.assertIn("plugins/demo/.codex-plugin/plugin.json", plugin["codex_release_check_urls"][0])
+
+    def test_plugin_bridge_prefers_source_repo_when_claude_manifest_exists(self) -> None:
+        cache_dir = self.add_installed_claude_plugin_cache()
+        source_dir = self.home / ".claude" / "plugins" / "marketplaces" / "demo-market" / "plugins" / "demo"
+        (source_dir / ".claude-plugin").mkdir(parents=True, exist_ok=True)
+        (source_dir / ".claude-plugin" / "plugin.json").write_text(
+            json.dumps({"name": "demo", "version": "1.0.0", "description": "Source Claude demo"}),
+            encoding="utf-8",
+        )
+
+        manifest = self.module.build_manifest(str(self.project), last=1)
+        plugin = next(
+            item
+            for item in self.module.global_action_candidates(manifest)
+            if item["id"] == "plugin:demo@demo-market"
+        )
+
+        self.assertEqual(plugin["bridge_source_kind"], "source-repo")
+        self.assertEqual(plugin["bridge_source_path"], str(source_dir.resolve()))
+        self.assertEqual(plugin["bridge_cache_fallback_path"], str(cache_dir))
+        self.assertIn("source repo plugin", plugin["evidence"])
 
     def test_github_codex_check_marks_native_manifest(self) -> None:
         self.add_installed_claude_plugin_cache()
@@ -986,6 +1007,23 @@ class AiHandoffTests(unittest.TestCase):
         self.assertIn("[ ] Codex-wide installs: 0 selected, 0 executed", rendered)
         self.assertIn("Press g to review installs that affect every Codex project", rendered)
         self.assertIn("Space toggles/opens row", rendered)
+
+    def test_default_tty_entry_uses_wizard_flow(self) -> None:
+        with mock.patch.object(self.module.sys.stdin, "isatty", return_value=True):
+            with mock.patch.object(self.module, "wizard_flow", return_value=0) as wizard:
+                code = self.module.main([str(self.project)])
+
+        self.assertEqual(code, 0)
+        wizard.assert_called_once()
+
+    def test_wizard_global_summary_counts_candidates(self) -> None:
+        manifest = self.module.build_manifest(str(self.project), last=1)
+        summary = self.module.wizard_global_candidate_summary(manifest)
+
+        self.assertGreaterEqual(summary["total"], 3)
+        self.assertGreaterEqual(summary["plugins"], 1)
+        self.assertGreaterEqual(summary["skills"], 1)
+        self.assertGreaterEqual(summary["mcps"], 1)
 
     def test_static_menu_draw_clears_viewport_when_supported(self) -> None:
         manifest = self.module.build_manifest(str(self.project), last=1)
