@@ -28,6 +28,8 @@ bin/ai-handoff apply /path/to/project --yes --ack-privacy
 
 MCP, plugin, and skill installs are never executed by default. They install under `~/.codex`, so they are available in every Codex project for this OS user. The wizard first asks which Claude conversations to use, then applies project-local handoff files, then shows progress while it scans tooling and checks GitHub/native-Codex compatibility. Step 3 lists conversation-matched tooling with bridge reasons, lets you pick tools by number, then asks whether to record the carryover plan in the project handoff or install it for this Codex user after confirmation. Selected installs can also be executed later with:
 
+Interactive TTY screens redraw in place while work is running. Color is enabled for TTY output unless `NO_COLOR` is set.
+
 ```bash
 bin/ai-handoff globals /path/to/project
 bin/ai-handoff globals /path/to/project --project-only

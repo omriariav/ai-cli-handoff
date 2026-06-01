@@ -2807,6 +2807,13 @@ INTERACTIVE_OPTIONS = [
 ANSI_CLEAR_VIEWPORT = "\033[2J\033[H"
 ANSI_HIDE_CURSOR = "\033[?25l"
 ANSI_SHOW_CURSOR = "\033[?25h"
+ANSI_RESET = "\033[0m"
+ANSI_BOLD = "\033[1m"
+ANSI_DIM = "\033[2m"
+ANSI_CYAN = "\033[36m"
+ANSI_GREEN = "\033[32m"
+ANSI_YELLOW = "\033[33m"
+ANSI_RED = "\033[31m"
 GLOBAL_ACTION_TYPES = {"mcp", "skill", "plugin"}
 GLOBAL_PICKER_MODES = ("used", "all", "mcp", "skill", "plugin", "manual")
 GLOBAL_PICKER_PAGE_SIZE = 10
@@ -2815,6 +2822,21 @@ GLOBAL_PICKER_PAGE_SIZE = 10
 def supports_static_menu() -> bool:
     term = os.environ.get("TERM", "")
     return bool(sys.stdin.isatty() and sys.stdout.isatty() and term and term != "dumb")
+
+
+def supports_color() -> bool:
+    term = os.environ.get("TERM", "")
+    return bool(sys.stdout.isatty() and term and term != "dumb" and "NO_COLOR" not in os.environ)
+
+
+def color_text(text: str, code: str) -> str:
+    if not supports_color():
+        return text
+    return f"{code}{text}{ANSI_RESET}"
+
+
+def step_heading(step: str, title: str) -> str:
+    return f"{color_text(step, ANSI_BOLD)}: {color_text(title, ANSI_CYAN)}"
 
 
 def render_interactive_menu(manifest: Dict[str, Any], cursor: int = 0) -> str:
@@ -4460,7 +4482,7 @@ def wizard_answer(prompt: str, default: str = "") -> str:
 def print_wizard_header(manifest: Dict[str, Any]) -> None:
     sessions = manifest["claude"]["sessions"]
     confidence = manifest.get("handoff_confidence", {})
-    print("AI Handoff Wizard")
+    print(color_text("AI Handoff Wizard", ANSI_BOLD))
     print(f"Project: {manifest['target_path']}")
     print(f"Confidence: {confidence.get('level', 'unknown')} - {confidence.get('reason', '')}")
     print(
@@ -4478,7 +4500,7 @@ def wizard_review_sessions(manifest: Dict[str, Any]) -> bool:
     show_session_sample = True
     while True:
         sessions = manifest["claude"]["sessions"]
-        print("Step 1/3: Claude Context")
+        print(step_heading("Step 1/3", "Claude Context"))
         print(f"Selected {sessions.get('selected_count', 0)} of {sessions.get('found_count', 0)} discovered session(s).")
         if show_session_sample:
             for bullet in session_bullets(manifest, limit=3):
@@ -4505,7 +4527,7 @@ def wizard_review_sessions(manifest: Dict[str, Any]) -> bool:
 
 def wizard_apply_project_files(manifest: Dict[str, Any]) -> Tuple[bool, bool]:
     while True:
-        print("Step 2/3: Project Files")
+        print(step_heading("Step 2/3", "Project Files"))
         print("Will write project-local handoff files only:")
         for path in manifest["actions"].get("project_writes", []):
             print(f"  - {path}")
@@ -4555,13 +4577,16 @@ def wizard_global_candidate_summary(manifest: Dict[str, Any]) -> Dict[str, int]:
 
 def tooling_candidate_line(candidate: Dict[str, Any]) -> str:
     action_type = str(candidate.get("type") or "tool")
+    candidate_id = color_text(str(candidate.get("id") or "unknown"), ANSI_CYAN)
     if action_type == "plugin" and candidate.get("bridge"):
-        return f"{candidate.get('id')} -> {candidate.get('bridge_name')} ({bridge_reason_text(candidate)})"
+        bridge_name = color_text(str(candidate.get("bridge_name") or "bridge"), ANSI_GREEN)
+        reason = color_text(bridge_reason_text(candidate), ANSI_DIM)
+        return f"{candidate_id} -> {bridge_name} ({reason})"
     if action_type == "skill":
-        return f"{candidate.get('id')} -> {candidate.get('destination_path')}"
+        return f"{candidate_id} -> {candidate.get('destination_path')}"
     if action_type == "mcp":
-        return f"{candidate.get('id')} -> {candidate.get('command')}"
-    return str(candidate.get("id") or candidate.get("label") or "unknown")
+        return f"{candidate_id} -> {candidate.get('command')}"
+    return str(candidate.get("label") or candidate_id)
 
 
 def bridge_reason_text(candidate: Dict[str, Any]) -> str:
@@ -4680,32 +4705,63 @@ def wizard_apply_tooling_selection(
         print("Choose Enter, i, or q.")
 
 
-def wizard_tooling_progress(message: str) -> None:
-    print(f"  - {message}", flush=True)
+def render_tooling_progress(lines: List[str]) -> str:
+    rendered = [step_heading("Step 3/3", "Tooling Carryover"), ""]
+    rendered.extend(f"  {color_text('[info]', ANSI_CYAN)} {line}" for line in lines)
+    return "\n".join(rendered)
 
 
-def wizard_github_progress(index: int, total: int, candidate: Dict[str, Any]) -> None:
+def draw_tooling_progress(lines: List[str]) -> None:
+    if supports_static_menu():
+        sys.stdout.write(ANSI_CLEAR_VIEWPORT)
+    print(render_tooling_progress(lines), flush=True)
+
+
+def wizard_tooling_progress(lines: List[str], message: str) -> None:
+    lines.append(message)
+    if supports_static_menu():
+        draw_tooling_progress(lines)
+    else:
+        print(f"  - {message}", flush=True)
+
+
+def wizard_github_progress(lines: List[str], index: int, total: int, candidate: Dict[str, Any]) -> None:
     if total <= 0:
         return
     if index == 1 or index == total or index % 5 == 0:
         repo = str(candidate.get("origin_github_repo") or "GitHub origin")
-        wizard_tooling_progress(f"Checking GitHub/Codex compatibility {index}/{total}: {repo}")
+        wizard_tooling_progress(lines, f"Checking GitHub/Codex compatibility {index}/{total}: {repo}")
+
+
+def print_tooling_summary_header() -> None:
+    if supports_static_menu():
+        sys.stdout.write(ANSI_CLEAR_VIEWPORT)
+    print(step_heading("Step 3/3", "Tooling Carryover"))
 
 
 def wizard_review_globals(manifest: Dict[str, Any], project_applied: bool) -> bool:
-    print("Step 3/3: Tooling Carryover", flush=True)
-    wizard_tooling_progress("Scanning selected Claude conversations for MCP, skill, and plugin usage...")
+    progress_lines: List[str] = []
+    draw_tooling_progress(progress_lines)
+    wizard_tooling_progress(progress_lines, "Scanning selected Claude conversations for MCP, skill, and plugin usage...")
     base_candidates = global_action_candidates(manifest)
     github_check_count = sum(1 for candidate in base_candidates if candidate.get("origin_github_repo"))
     wizard_tooling_progress(
+        progress_lines,
         f"Found {len(base_candidates)} possible carryover action(s); "
         f"{github_check_count} need GitHub/Codex compatibility checks."
     )
-    all_candidates = annotate_github_codex_releases(base_candidates, progress=wizard_github_progress)
+    all_candidates = annotate_github_codex_releases(
+        base_candidates,
+        progress=lambda index, total, candidate: wizard_github_progress(progress_lines, index, total, candidate),
+    )
     manifest["_display_global_action_candidates"] = all_candidates
     summary = wizard_global_candidate_summary(manifest)
     matched_candidates = conversation_matched_global_candidates(manifest)
-    wizard_tooling_progress(f"Ready: {summary['used']} conversation-matched action(s), {summary['total']} total discovered.")
+    wizard_tooling_progress(
+        progress_lines,
+        f"Ready: {summary['used']} conversation-matched action(s), {summary['total']} total discovered.",
+    )
+    print_tooling_summary_header()
     print()
     if summary["used"]:
         print(

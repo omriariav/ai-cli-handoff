@@ -41,6 +41,7 @@ bin/ai-handoff /path/to/project
    - In the conversation picker, use `/` filter, `f`/`b` page, `d` details, Space or row numbers to toggle, Enter to commit, and `q` to cancel draft changes.
    - In the Codex-wide install picker, use `/` filter, `Tab` view, `f`/`b` page, `d` details, `A` safe visible bulk-select, `u` clear visible, `C` clear all, `i` invert visible, and `?` help.
    - If no conversations are found, try `conversations --all-projects --search TEXT` or use `--from-claude-project KEY` from `doctor`/nearby match output.
+   - TTY screens should redraw in place while long checks run. Use color for headings/status when supported, but respect `NO_COLOR`.
 6. Apply selected Codex-wide installs only after explicit confirmation. These can change `~/.codex` and affect every Codex project/folder on this machine:
    - MCP imports run selected `codex mcp add ...` commands.
    - Skill imports copy selected Claude skill folders into `~/.codex/skills`.

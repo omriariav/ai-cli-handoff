@@ -1254,6 +1254,27 @@ class AiHandoffTests(unittest.TestCase):
         self.assertTrue(continued)
         self.assertEqual(len(manifest["selected_global_action_ids"]), 1)
 
+    def test_tooling_progress_static_draw_clears_viewport(self) -> None:
+        stdout = io.StringIO()
+
+        with mock.patch.object(self.module, "supports_static_menu", return_value=True):
+            with contextlib.redirect_stdout(stdout):
+                self.module.draw_tooling_progress(["Scanning selected Claude conversations..."])
+
+        rendered = stdout.getvalue()
+        self.assertTrue(rendered.startswith(self.module.ANSI_CLEAR_VIEWPORT))
+        self.assertIn("Step 3/3: Tooling Carryover", rendered)
+        self.assertIn("[info] Scanning selected Claude conversations", rendered)
+
+    def test_color_text_uses_ansi_only_when_supported(self) -> None:
+        with mock.patch.object(self.module, "supports_color", return_value=False):
+            self.assertEqual(self.module.color_text("hello", self.module.ANSI_GREEN), "hello")
+        with mock.patch.object(self.module, "supports_color", return_value=True):
+            self.assertEqual(
+                self.module.color_text("hello", self.module.ANSI_GREEN),
+                f"{self.module.ANSI_GREEN}hello{self.module.ANSI_RESET}",
+            )
+
     def test_tooling_line_explains_bridge_when_github_has_no_native_manifest(self) -> None:
         line = self.module.tooling_candidate_line(
             {

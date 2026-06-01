@@ -73,6 +73,8 @@ Conversation recovery must not depend on one exact Claude project folder. `conve
 
 The wizard must keep installs behind a second confirmation that explicitly says it can change `~/.codex` and make tooling available in every Codex project for this OS user. Codex CLI currently exposes these installs as user-level, not project-local; project-only means recording intent and context in AGENTS.md/manifest without installing.
 
+Use restrained ANSI color in TTY mode for headings, status labels, selected carryover names, and warnings. Respect `NO_COLOR` and keep non-TTY output plain. Long-running wizard screens should redraw the current viewport rather than append progress lines.
+
 The completion screen should increase confidence by listing what changed: selected conversation count, project files written, Codex-wide installs completed or recorded, artifact paths to inspect, and the next `codex` command. `AGENTS.md` should state that Codex loads it automatically for the project, list every selected conversation, and include a `Codex Tooling Prepared` section for installed or recorded MCP/skill/plugin actions.
 
 ## Legacy Static Menu
