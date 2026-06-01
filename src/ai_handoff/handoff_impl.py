@@ -925,8 +925,19 @@ def annotate_github_codex_release(candidate: Dict[str, Any]) -> Dict[str, Any]:
     return candidate
 
 
-def annotate_github_codex_releases(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    return [annotate_github_codex_release(dict(candidate)) for candidate in candidates]
+def annotate_github_codex_releases(candidates: List[Dict[str, Any]], progress: Optional[Any] = None) -> List[Dict[str, Any]]:
+    checkable = [candidate for candidate in candidates if candidate.get("origin_github_repo")]
+    checkable_total = len(checkable)
+    checked = 0
+    annotated = []
+    for candidate in candidates:
+        candidate_copy = dict(candidate)
+        if candidate_copy.get("origin_github_repo"):
+            checked += 1
+            if progress:
+                progress(checked, checkable_total, candidate_copy)
+        annotated.append(annotate_github_codex_release(candidate_copy))
+    return annotated
 
 
 def github_check_fallback_text(candidate: Dict[str, Any]) -> str:
@@ -4545,12 +4556,31 @@ def wizard_global_candidate_summary(manifest: Dict[str, Any]) -> Dict[str, int]:
 def tooling_candidate_line(candidate: Dict[str, Any]) -> str:
     action_type = str(candidate.get("type") or "tool")
     if action_type == "plugin" and candidate.get("bridge"):
-        return f"{candidate.get('id')} -> {candidate.get('bridge_name')} (bridged plugin)"
+        return f"{candidate.get('id')} -> {candidate.get('bridge_name')} ({bridge_reason_text(candidate)})"
     if action_type == "skill":
         return f"{candidate.get('id')} -> {candidate.get('destination_path')}"
     if action_type == "mcp":
         return f"{candidate.get('id')} -> {candidate.get('command')}"
     return str(candidate.get("id") or candidate.get("label") or "unknown")
+
+
+def bridge_reason_text(candidate: Dict[str, Any]) -> str:
+    status = str(candidate.get("codex_release_status") or "")
+    error = str(candidate.get("github_codex_check_error") or "")
+    if status == "github-origin-checked-no-native":
+        return "bridge; GitHub source checked, no native Codex plugin manifest found"
+    if status == "github-check-failed":
+        suffix = f": {truncate(error, 80)}" if error else ""
+        return f"bridge fallback; GitHub native-Codex check failed{suffix}"
+    if status == "github-native-codex-manifest":
+        return "native Codex manifest detected"
+    if candidate.get("github_codex_checked") and not candidate.get("github_codex_manifest_exists"):
+        return "bridge; GitHub source checked, no native Codex plugin manifest found"
+    if candidate.get("origin_github_repo"):
+        return "bridge; GitHub source known, native Codex package not detected"
+    if candidate.get("bridge_source_kind") == "source-repo":
+        return "bridge from source repo; native Codex package not detected"
+    return "bridge from Claude plugin; native Codex package not detected"
 
 
 def persist_wizard_tooling_state(manifest: Dict[str, Any], project_applied: bool) -> bool:
@@ -4565,12 +4595,118 @@ def persist_wizard_tooling_state(manifest: Dict[str, Any], project_applied: bool
     return True
 
 
+def parse_tooling_selection(answer: str, candidates: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], str]:
+    normalized = answer.strip().lower()
+    if normalized in {"", "all", "a", "yes", "y"}:
+        return candidates, ""
+    parts = [part for part in re.split(r"[\s,]+", normalized) if part]
+    selected = []
+    bad = []
+    seen = set()
+    for part in parts:
+        if not part.isdigit():
+            bad.append(part)
+            continue
+        index = int(part)
+        if index < 1 or index > len(candidates):
+            bad.append(part)
+            continue
+        candidate = candidates[index - 1]
+        candidate_id = str(candidate.get("id"))
+        if candidate_id in seen:
+            continue
+        seen.add(candidate_id)
+        selected.append(candidate)
+    if bad:
+        return [], "unknown selection: " + ", ".join(bad)
+    if not selected:
+        return [], "no tools selected"
+    return selected, ""
+
+
+def wizard_select_matched_tooling(candidates: List[Dict[str, Any]]) -> Tuple[str, List[Dict[str, Any]]]:
+    while True:
+        answer = wizard_answer("\nSelect tools to carry over [Enter=all/1,3/c customize/s skip/q] ", "all")
+        if answer in {"q", "quit"}:
+            return "quit", []
+        if answer in {"s", "skip", "n", "no"}:
+            return "skip", []
+        if answer in {"c", "customize", "review"}:
+            return "customize", []
+        selected, error = parse_tooling_selection(answer, candidates)
+        if error:
+            print(f"{error}. Choose Enter, numbers like 1,3, c, s, or q.")
+            continue
+        return "selected", selected
+
+
+def wizard_apply_tooling_selection(
+    manifest: Dict[str, Any],
+    project_applied: bool,
+    selected: List[Dict[str, Any]],
+) -> bool:
+    set_selected_global_actions(
+        manifest,
+        [str(candidate["id"]) for candidate in selected],
+        selected,
+    )
+    while True:
+        answer = wizard_answer("Carry over selected tools how? [Enter=project-only/i install for user/q] ", "project-only")
+        if answer in {"q", "quit"}:
+            print("Stopped before tooling carryover.")
+            return False
+        if answer in {"project-only", "p", "record", "r", "yes", "y"}:
+            if not persist_wizard_tooling_state(manifest, project_applied):
+                return False
+            print("Recorded selected tooling in the project handoff; no ~/.codex changes were made.")
+            return True
+        if answer in {"i", "install", "user", "install-user"}:
+            if confirm_global_apply(manifest):
+                global_results = apply_selected_global_actions(manifest)
+                if not persist_wizard_tooling_state(manifest, project_applied):
+                    return False
+                print("Install results:")
+                for item in global_results:
+                    label = item.get("id")
+                    status = item.get("status")
+                    reason = item.get("reason")
+                    suffix = f" ({reason})" if reason else ""
+                    print(f"  - {label}: {status}{suffix}")
+            else:
+                if not persist_wizard_tooling_state(manifest, project_applied):
+                    return False
+                print("Selected tooling carryover actions were recorded in the project handoff; none were installed.")
+            return True
+        print("Choose Enter, i, or q.")
+
+
+def wizard_tooling_progress(message: str) -> None:
+    print(f"  - {message}", flush=True)
+
+
+def wizard_github_progress(index: int, total: int, candidate: Dict[str, Any]) -> None:
+    if total <= 0:
+        return
+    if index == 1 or index == total or index % 5 == 0:
+        repo = str(candidate.get("origin_github_repo") or "GitHub origin")
+        wizard_tooling_progress(f"Checking GitHub/Codex compatibility {index}/{total}: {repo}")
+
+
 def wizard_review_globals(manifest: Dict[str, Any], project_applied: bool) -> bool:
-    all_candidates = annotate_github_codex_releases(global_action_candidates(manifest))
+    print("Step 3/3: Tooling Carryover", flush=True)
+    wizard_tooling_progress("Scanning selected Claude conversations for MCP, skill, and plugin usage...")
+    base_candidates = global_action_candidates(manifest)
+    github_check_count = sum(1 for candidate in base_candidates if candidate.get("origin_github_repo"))
+    wizard_tooling_progress(
+        f"Found {len(base_candidates)} possible carryover action(s); "
+        f"{github_check_count} need GitHub/Codex compatibility checks."
+    )
+    all_candidates = annotate_github_codex_releases(base_candidates, progress=wizard_github_progress)
     manifest["_display_global_action_candidates"] = all_candidates
     summary = wizard_global_candidate_summary(manifest)
     matched_candidates = conversation_matched_global_candidates(manifest)
-    print("Step 3/3: Tooling Carryover")
+    wizard_tooling_progress(f"Ready: {summary['used']} conversation-matched action(s), {summary['total']} total discovered.")
+    print()
     if summary["used"]:
         print(
             f"Found in selected Claude conversations: "
@@ -4588,8 +4724,8 @@ def wizard_review_globals(manifest: Dict[str, Any], project_applied: bool) -> bo
         return True
 
     if matched_candidates:
-        for candidate in matched_candidates[:8]:
-            print(f"  - {tooling_candidate_line(candidate)}")
+        for index, candidate in enumerate(matched_candidates[:8], start=1):
+            print(f"  {index}. {tooling_candidate_line(candidate)}")
         if len(matched_candidates) > 8:
             print(f"  - +{len(matched_candidates) - 8} more")
         additional = summary["total"] - len(matched_candidates)
@@ -4597,40 +4733,27 @@ def wizard_review_globals(manifest: Dict[str, Any], project_applied: bool) -> bo
             print(f"{additional} additional inventory candidate(s) are available with Customize.")
         print("Project-only records this in AGENTS.md/manifest without touching ~/.codex.")
         print("Install for this Codex user writes under ~/.codex and is available in every Codex project for this user.")
-        prompt = "\nCarry over conversation-matched tooling? [Enter=project-only/i install for user/c customize/s skip/q] "
-        answer = wizard_answer(prompt, "project-only")
+        action, selected = wizard_select_matched_tooling(matched_candidates)
     else:
         prompt = "\nReview broader tooling inventory? [y/N] "
         answer = wizard_answer(prompt, "n")
+        action = "customize" if answer in {"y", "yes", "r", "review"} else answer
+        selected = []
 
-    if answer in {"q", "quit"}:
+    if action in {"q", "quit"}:
         print("Stopped before tooling carryover.")
         return False
-    if answer in {"s", "skip", "n", "no"}:
+    if action in {"s", "skip", "n", "no"}:
         print("Skipped tooling carryover.")
         return True
 
-    if answer in {"project-only", "p", "record", "r", "yes", "y"} and matched_candidates:
-        set_selected_global_actions(
-            manifest,
-            [str(candidate["id"]) for candidate in matched_candidates],
-            matched_candidates,
-        )
-        if not persist_wizard_tooling_state(manifest, project_applied):
-            return False
-        print("Recorded conversation-matched tooling in the project handoff; no ~/.codex changes were made.")
-        return True
+    if action == "selected" and selected:
+        return wizard_apply_tooling_selection(manifest, project_applied, selected)
 
-    if answer in {"i", "install", "user", "install-user"} and matched_candidates:
-        set_selected_global_actions(
-            manifest,
-            [str(candidate["id"]) for candidate in matched_candidates],
-            matched_candidates,
-        )
-    elif answer in {"c", "customize", "review", "all"} or not matched_candidates:
+    if action in {"c", "customize", "review", "all"} or not matched_candidates:
         global_picker(manifest)
     else:
-        print("Choose Enter, i, c, s, or q.")
+        print("Choose Enter, numbers, c, s, or q.")
         return wizard_review_globals(manifest, project_applied)
 
     if not selected_global_candidates(manifest):

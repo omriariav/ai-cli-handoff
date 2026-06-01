@@ -1215,27 +1215,58 @@ class AiHandoffTests(unittest.TestCase):
 
         self.assertTrue(continued)
         self.assertIn("Step 3/3: Tooling Carryover", stdout.getvalue())
+        self.assertIn("Scanning selected Claude conversations", stdout.getvalue())
+        self.assertIn("possible carryover action", stdout.getvalue())
+        self.assertIn("Ready:", stdout.getvalue())
         self.assertIn("Found in selected Claude conversations", stdout.getvalue())
         self.assertIn("additional inventory candidate(s) are available with Customize", stdout.getvalue())
         self.assertEqual(
             prompts,
-            ["\nCarry over conversation-matched tooling? [Enter=project-only/i install for user/c customize/s skip/q] "],
+            ["\nSelect tools to carry over [Enter=all/1,3/c customize/s skip/q] "],
         )
 
     def test_wizard_tooling_project_only_records_matched_actions(self) -> None:
         self.append_transcript_usage_events()
         manifest = self.module.build_manifest(str(self.project), last=1)
         stdout = io.StringIO()
+        answers = iter(["all", "project-only"])
 
-        with mock.patch.object(self.module, "wizard_answer", return_value="project-only"):
+        with mock.patch.object(self.module, "wizard_answer", side_effect=lambda *args: next(answers)):
             with contextlib.redirect_stdout(stdout):
                 continued = self.module.wizard_review_globals(manifest, project_applied=False)
 
         self.assertTrue(continued)
-        self.assertIn("Recorded conversation-matched tooling", stdout.getvalue())
+        self.assertIn("Recorded selected tooling", stdout.getvalue())
         self.assertIn("skill:sample-skill", manifest["selected_global_action_ids"])
         self.assertFalse(manifest["global_apply_results"])
         self.assertTrue((self.project / ".codex" / "handoff" / "manifest.json").exists())
+
+    def test_wizard_tooling_can_pick_matched_subset_by_number(self) -> None:
+        self.append_transcript_usage_events()
+        manifest = self.module.build_manifest(str(self.project), last=1)
+        stdout = io.StringIO()
+        answers = iter(["1", "project-only"])
+
+        with mock.patch.object(self.module, "wizard_answer", side_effect=lambda *args: next(answers)):
+            with contextlib.redirect_stdout(stdout):
+                continued = self.module.wizard_review_globals(manifest, project_applied=False)
+
+        self.assertTrue(continued)
+        self.assertEqual(len(manifest["selected_global_action_ids"]), 1)
+
+    def test_tooling_line_explains_bridge_when_github_has_no_native_manifest(self) -> None:
+        line = self.module.tooling_candidate_line(
+            {
+                "id": "plugin:x@omri-cc-stuff",
+                "type": "plugin",
+                "bridge": True,
+                "bridge_name": "cc-x",
+                "codex_release_status": "github-origin-checked-no-native",
+            }
+        )
+
+        self.assertIn("GitHub source checked", line)
+        self.assertIn("no native Codex plugin manifest", line)
 
     def test_used_bridge_candidate_group_is_conversation_matched(self) -> None:
         group = self.module.global_candidate_group(
