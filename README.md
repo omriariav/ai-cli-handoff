@@ -1,10 +1,10 @@
 # AI CLI Handoff
 
-`ai-handoff` prepares a Claude Code project for work in Codex.
+`ai-handoff` is an AI agent handoff CLI for carrying project context, guidance, and tooling between coding assistants.
 
-It is built for the moment when Claude Code context exists, Claude rate limits are gone, and you want Codex to continue from the same project reality instead of starting cold.
+The first supported flow is `Claude Code -> Codex`: when Claude Code context exists, Claude rate limits are gone, and you want Codex to continue from the same project reality instead of starting cold.
 
-The CLI reads the target folder, selected Claude Code conversations, `CLAUDE.md`, local Claude setup, and discovered MCP/skill/plugin usage. It then creates Codex-ready handoff artifacts such as `AGENTS.md` and `.codex/handoff/manifest.json`. Optional Codex user-level tooling carryover is reviewed separately and never runs by accident.
+For that flow, the CLI reads the target folder, selected Claude Code conversations, `CLAUDE.md`, local Claude setup, and discovered MCP/skill/plugin usage. It then creates Codex-ready handoff artifacts such as `AGENTS.md` and `.codex/handoff/manifest.json`. Optional Codex user-level tooling carryover is reviewed separately and never runs by accident.
 
 Current version: `0.1.0`
 
@@ -32,7 +32,9 @@ The default command opens a one-time wizard. It does not write files or install 
 
 ## What It Does
 
-`ai-handoff` prepares a Claude Code project for Codex by:
+`ai-handoff` is built around handoff flows. In `0.1.0`, the implemented flow is `Claude Code -> Codex`.
+
+That flow prepares a project for Codex by:
 
 - Selecting recent Claude Code conversations, defaulting to the latest three relevant sessions.
 - Letting you choose more conversations with a static checkbox picker.
@@ -348,4 +350,4 @@ Recommended order: merge the PR first, then tag the merge commit on `main`.
 
 ## Status
 
-`0.1.0` is the first usable Claude Code -> Codex handoff release. The reverse `Codex -> Claude Code` flow is intentionally visible in the wizard but not implemented yet.
+`0.1.0` is the first usable release of the generic handoff CLI, with `Claude Code -> Codex` as the first supported flow. The reverse `Codex -> Claude Code` flow is intentionally visible in the wizard but not implemented yet.
