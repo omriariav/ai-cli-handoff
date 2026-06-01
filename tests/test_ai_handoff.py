@@ -1231,6 +1231,21 @@ class AiHandoffTests(unittest.TestCase):
         self.assertEqual(manifest["flow"]["id"], "codex_to_claude")
         self.assertIn("not implemented yet", stdout.getvalue())
 
+    def test_wizard_project_files_step_clears_previous_step_in_static_mode(self) -> None:
+        manifest = self.module.build_manifest(str(self.project), last=1)
+        stdout = io.StringIO()
+
+        with mock.patch.object(self.module, "supports_static_menu", return_value=True):
+            with mock.patch.object(self.module, "wizard_answer", return_value="q"):
+                with contextlib.redirect_stdout(stdout):
+                    continued, applied = self.module.wizard_apply_project_files(manifest)
+
+        self.assertFalse(continued)
+        self.assertFalse(applied)
+        rendered = stdout.getvalue()
+        self.assertTrue(rendered.startswith(self.module.ANSI_CLEAR_VIEWPORT))
+        self.assertIn("Step 2/3: Project Files", rendered)
+
     def test_wizard_shows_selected_conversations_after_picker(self) -> None:
         manifest = self.module.build_manifest(str(self.project), last=1)
         answers = iter(["c", "q"])

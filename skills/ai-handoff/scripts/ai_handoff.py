@@ -4930,6 +4930,8 @@ def wizard_review_sessions(manifest: Dict[str, Any]) -> bool:
 
 def wizard_apply_project_files(manifest: Dict[str, Any]) -> Tuple[bool, bool]:
     while True:
+        if supports_static_menu():
+            sys.stdout.write(ANSI_CLEAR_VIEWPORT)
         print(step_heading("Step 2/3", "Project Files"))
         print("Will write project-local handoff files only:")
         for path in manifest["actions"].get("project_writes", []):
