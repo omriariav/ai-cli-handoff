@@ -1016,6 +1016,43 @@ class AiHandoffTests(unittest.TestCase):
         self.assertEqual(code, 0)
         wizard.assert_called_once()
 
+    def test_wizard_claude_context_prompt_has_spacing_and_clear_copy(self) -> None:
+        manifest = self.module.build_manifest(str(self.project), last=1)
+        prompts = []
+
+        def fake_answer(prompt: str, default: str = "") -> str:
+            prompts.append(prompt)
+            return "q"
+
+        with mock.patch.object(self.module, "wizard_answer", side_effect=fake_answer):
+            with contextlib.redirect_stdout(io.StringIO()):
+                continued = self.module.wizard_review_sessions(manifest)
+
+        self.assertFalse(continued)
+        self.assertEqual(
+            prompts,
+            ["\nContinue, choose more conversations, skip context, or quit? [Enter/c/s/q] "],
+        )
+
+    def test_wizard_hides_session_sample_after_picker(self) -> None:
+        manifest = self.module.build_manifest(str(self.project), last=1)
+        answers = iter(["c", "q"])
+        stdout = io.StringIO()
+
+        def fake_answer(prompt: str, default: str = "") -> str:
+            return next(answers)
+
+        with mock.patch.object(self.module, "wizard_answer", side_effect=fake_answer):
+            with mock.patch.object(self.module, "session_picker", return_value=True):
+                with contextlib.redirect_stdout(stdout):
+                    continued = self.module.wizard_review_sessions(manifest)
+
+        self.assertFalse(continued)
+        renders = stdout.getvalue().split("Step 1/3: Claude Context")
+        self.assertEqual(len(renders), 3)
+        self.assertIn("  - ", renders[1])
+        self.assertNotIn("  - ", renders[2])
+
     def test_wizard_global_summary_counts_candidates(self) -> None:
         manifest = self.module.build_manifest(str(self.project), last=1)
         summary = self.module.wizard_global_candidate_summary(manifest)

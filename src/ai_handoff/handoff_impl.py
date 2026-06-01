@@ -4376,18 +4376,21 @@ def print_wizard_header(manifest: Dict[str, Any]) -> None:
 
 
 def wizard_review_sessions(manifest: Dict[str, Any]) -> bool:
+    show_session_sample = True
     while True:
         sessions = manifest["claude"]["sessions"]
         print("Step 1/3: Claude Context")
         print(f"Selected {sessions.get('selected_count', 0)} of {sessions.get('found_count', 0)} discovered session(s).")
-        for bullet in session_bullets(manifest, limit=3):
-            print("  " + bullet)
-        answer = wizard_answer("Continue, choose conversations, skip context, or quit? [Enter/c/s/q] ", "continue")
+        if show_session_sample:
+            for bullet in session_bullets(manifest, limit=3):
+                print("  " + bullet)
+        answer = wizard_answer("\nContinue, choose more conversations, skip context, or quit? [Enter/c/s/q] ", "continue")
         if answer in {"q", "quit"}:
             print("No files changed.")
             return False
         if answer in {"c", "choose", "conversations"}:
             session_picker(manifest)
+            show_session_sample = False
             print()
             continue
         if answer in {"s", "skip"}:

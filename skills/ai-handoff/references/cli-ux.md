@@ -67,7 +67,7 @@ Conversation recovery must not depend on one exact Claude project folder. `conve
 
 `ai-handoff <path>` is optimized for a one-time handoff. It should read as a wizard, not a dashboard:
 
-1. Claude context: show found/selected sessions and transcript-used tools. Let the user continue, choose conversations, skip context, or quit.
+1. Claude context: show found/selected sessions and transcript-used tools. Let the user continue, choose more conversations, skip context, or quit. After the user returns from the conversation picker, show only the selected/found count instead of repeating the earlier sample sessions.
 2. Project files: show the exact project-local files, offer preview diff, apply, skip, or quit.
 3. Codex-wide actions: summarize candidate counts and default to review when transcript-used candidates exist. The picker remains available for detailed selection, but there is no hidden `g` command in the normal path.
 
