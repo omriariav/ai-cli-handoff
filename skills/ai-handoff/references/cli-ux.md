@@ -69,9 +69,9 @@ Conversation recovery must not depend on one exact Claude project folder. `conve
 
 1. Claude context: show found/selected sessions and transcript-used tools. Let the user continue, choose more conversations, skip context, or quit. After the user returns from the conversation picker, show only the selected/found count instead of repeating the earlier sample sessions.
 2. Project files: show the exact project-local files, offer preview diff, apply, skip, or quit.
-3. Codex-wide actions: summarize conversation-matched candidates first and default to review when transcript-used candidates exist. Broader Claude inventory counts can be mentioned as secondary context and remain available through picker views, but the primary Step 3 question should be about actions relevant to the selected conversations.
+3. Tooling carryover: summarize conversation-matched MCPs, skills, and plugins first. Do not open the detailed install picker by default. The primary choice should be scope/action: record in project handoff only, install for this Codex user, customize exact items, skip, or quit. Broader Claude inventory counts can be mentioned as secondary context and remain available through Customize, but the primary Step 3 question should be about tooling relevant to the selected conversations.
 
-The wizard must keep Codex-wide execution behind a second confirmation that explicitly says it can change `~/.codex` for every Codex project.
+The wizard must keep installs behind a second confirmation that explicitly says it can change `~/.codex` and make tooling available in every Codex project for this OS user. Codex CLI currently exposes these installs as user-level, not project-local; project-only means recording intent and context in AGENTS.md/manifest without installing.
 
 The completion screen should increase confidence by listing what changed: selected conversation count, project files written, Codex-wide installs completed or recorded, artifact paths to inspect, and the next `codex` command. `AGENTS.md` should state that Codex loads it automatically for the project, list every selected conversation, and include a `Codex Tooling Prepared` section for installed or recorded MCP/skill/plugin actions.
 

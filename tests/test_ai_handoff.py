@@ -1111,6 +1111,41 @@ class AiHandoffTests(unittest.TestCase):
         self.assertEqual(code, 0)
         wizard.assert_called_once()
 
+    def test_default_wizard_reuses_saved_session_selection(self) -> None:
+        project_sessions = self.home / ".claude" / "projects" / self.module.claude_project_key(self.project)
+        session_2 = project_sessions / "session-2.jsonl"
+        session_2.write_text(
+            json.dumps({"message": {"role": "user", "content": "newer work"}}) + "\n",
+            encoding="utf-8",
+        )
+        index_path = project_sessions / "sessions-index.json"
+        index = json.loads(index_path.read_text(encoding="utf-8"))
+        index["entries"].append(
+            {
+                "sessionId": "session-2",
+                "fullPath": str(session_2),
+                "firstPrompt": "newer work",
+                "summary": "Newer work",
+                "messageCount": 1,
+                "created": "2026-05-30T12:00:00Z",
+                "modified": "2026-05-30T12:05:00Z",
+                "gitBranch": "main",
+                "projectPath": str(self.project.resolve()),
+                "isSidechain": False,
+            }
+        )
+        index_path.write_text(json.dumps(index), encoding="utf-8")
+        saved = self.module.build_manifest(str(self.project), selected_session_ids=["session-1"])
+        self.module.write_manifest_artifacts(saved)
+
+        with mock.patch.object(self.module.sys.stdin, "isatty", return_value=True):
+            with mock.patch.object(self.module, "wizard_flow", return_value=0) as wizard:
+                code = self.module.main([str(self.project)])
+
+        self.assertEqual(code, 0)
+        manifest = wizard.call_args.args[0]
+        self.assertEqual(manifest["claude"]["sessions"]["selected_session_ids"], ["session-1"])
+
     def test_wizard_claude_context_prompt_has_spacing_and_clear_copy(self) -> None:
         manifest = self.module.build_manifest(str(self.project), last=1)
         prompts = []
@@ -1179,9 +1214,43 @@ class AiHandoffTests(unittest.TestCase):
                 continued = self.module.wizard_review_globals(manifest, project_applied=False)
 
         self.assertTrue(continued)
-        self.assertIn("conversation-matched candidate", stdout.getvalue())
-        self.assertIn("additional candidate(s) from broader Claude inventory", stdout.getvalue())
-        self.assertEqual(prompts, ["Review conversation-matched Codex-wide actions now? [Y/n] "])
+        self.assertIn("Step 3/3: Tooling Carryover", stdout.getvalue())
+        self.assertIn("Found in selected Claude conversations", stdout.getvalue())
+        self.assertIn("additional inventory candidate(s) are available with Customize", stdout.getvalue())
+        self.assertEqual(
+            prompts,
+            ["\nCarry over conversation-matched tooling? [Enter=project-only/i install for user/c customize/s skip/q] "],
+        )
+
+    def test_wizard_tooling_project_only_records_matched_actions(self) -> None:
+        self.append_transcript_usage_events()
+        manifest = self.module.build_manifest(str(self.project), last=1)
+        stdout = io.StringIO()
+
+        with mock.patch.object(self.module, "wizard_answer", return_value="project-only"):
+            with contextlib.redirect_stdout(stdout):
+                continued = self.module.wizard_review_globals(manifest, project_applied=False)
+
+        self.assertTrue(continued)
+        self.assertIn("Recorded conversation-matched tooling", stdout.getvalue())
+        self.assertIn("skill:sample-skill", manifest["selected_global_action_ids"])
+        self.assertFalse(manifest["global_apply_results"])
+        self.assertTrue((self.project / ".codex" / "handoff" / "manifest.json").exists())
+
+    def test_used_bridge_candidate_group_is_conversation_matched(self) -> None:
+        group = self.module.global_candidate_group(
+            {
+                "id": "plugin:x@omri-cc-stuff",
+                "type": "plugin",
+                "risk": "high",
+                "confidence": "medium",
+                "risk_badges": ["global-scope", "bridge"],
+                "bridge": True,
+                "used_in_selected_sessions": True,
+            }
+        )
+
+        self.assertEqual(group, "Conversation Matched")
 
     def test_wizard_completion_lists_confidence_artifacts_and_installs(self) -> None:
         manifest = self.module.build_manifest(str(self.project), last=1)

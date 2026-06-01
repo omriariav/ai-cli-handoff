@@ -2464,6 +2464,8 @@ def codex_tooling_status_lines(manifest: Dict[str, Any]) -> List[str]:
     results = [item for item in manifest.get("global_apply_results") or [] if isinstance(item, dict)]
     ok_results = [item for item in results if item.get("status") == "ok"]
     skipped_results = [item for item in results if item.get("status") and item.get("status") != "ok"]
+    ok_ids = {str(item.get("id")) for item in ok_results if item.get("id")}
+    recorded_only = [item for item in selected_actions if str(item.get("id")) not in ok_ids]
     lines: List[str] = []
     if ok_results:
         lines.append("- Installed Codex-wide for future Codex sessions:")
@@ -2471,11 +2473,11 @@ def codex_tooling_status_lines(manifest: Dict[str, Any]) -> List[str]:
             action = actions_by_id.get(str(result.get("id")), {"id": result.get("id")})
             lines.append(f"  - {global_action_display_name(action)}")
         lines.append("- Open a new Codex session after Codex-wide plugin or skill installs.")
-    elif selected_actions:
+    if recorded_only:
         lines.append("- Selected Codex-wide actions were recorded but not installed:")
-        for action in selected_actions:
+        for action in recorded_only:
             lines.append(f"  - {global_action_display_name(action)}")
-    else:
+    if not ok_results and not recorded_only:
         lines.append("- No Codex-wide MCP, plugin, or skill installs were executed by this run.")
     if skipped_results:
         lines.append("- Skipped/manual Codex-wide actions:")
@@ -3498,7 +3500,33 @@ def hidden_global_candidate_counts(manifest: Dict[str, Any], visible: List[Dict[
     }
 
 
+def candidate_can_be_carried_over(candidate: Dict[str, Any]) -> bool:
+    badges = set(candidate.get("risk_badges") or [])
+    if candidate.get("blocked_reason") or "secret" in badges:
+        return False
+    if candidate.get("confidence") == "low" and not candidate.get("bridge"):
+        return False
+    action_type = candidate.get("type")
+    if action_type == "plugin":
+        return bool(candidate.get("bridge") or candidate.get("command"))
+    if action_type == "skill":
+        return bool(candidate.get("source_path") and candidate.get("destination_path"))
+    if action_type == "mcp":
+        return bool(candidate.get("command"))
+    return False
+
+
+def conversation_matched_global_candidates(manifest: Dict[str, Any]) -> List[Dict[str, Any]]:
+    return [
+        candidate
+        for candidate in display_global_action_candidates(manifest)
+        if candidate.get("used_in_selected_sessions") and candidate_can_be_carried_over(candidate)
+    ]
+
+
 def global_candidate_group(candidate: Dict[str, Any]) -> str:
+    if candidate.get("used_in_selected_sessions") and candidate_can_be_carried_over(candidate):
+        return "Conversation Matched"
     if candidate.get("blocked_reason") or candidate.get("risk") == "high" or candidate.get("confidence") == "low":
         return "Manual / Unsafe"
     if candidate.get("source_scope") == "project" and candidate.get("portable"):
@@ -3507,7 +3535,7 @@ def global_candidate_group(candidate: Dict[str, Any]) -> str:
 
 
 def global_candidate_sort_key(candidate: Dict[str, Any]) -> Tuple[int, str, str]:
-    group_order = {"Recommended": 0, "Review": 1, "Manual / Unsafe": 2}
+    group_order = {"Conversation Matched": 0, "Recommended": 1, "Review": 2, "Manual / Unsafe": 3}
     return (
         group_order.get(global_candidate_group(candidate), 9),
         0 if candidate.get("used_in_selected_sessions") else 1,
@@ -3678,8 +3706,8 @@ def render_global_picker(
     current_page = 1 if not candidates else (start // page_size) + 1
     lines = [
         "",
-        "Choose Codex-Wide Installs",
-        "These may edit ~/.codex, bridge plugins, or run codex MCP/plugin commands for every Codex project on this machine after final confirmation.",
+        "Customize Tooling Carryover",
+        "Installs run for this Codex user under ~/.codex, so they are available in every Codex project after final confirmation.",
         (
             f"View: {mode} | Filter: {filter_text or 'none'} | "
             f"Showing: {start + 1 if candidates else 0}-{end} of {len(candidates)} | "
@@ -4133,8 +4161,8 @@ def confirm_global_apply(manifest: Dict[str, Any]) -> bool:
         sys.stdout.flush()
     try:
         print()
-        print("Selected Codex-wide installs:")
-        print("These can change ~/.codex and affect every Codex project/folder on this machine.")
+        print("Selected installs for this Codex user:")
+        print("These can change ~/.codex and become available in every Codex project for this user.")
         print("Blocked/manual imports will be skipped.")
         for group_name in ("Will copy", "Will bridge", "Will run", "Will skip/manual"):
             group_items = [candidate for candidate in selected if global_apply_plan_group(candidate)[0] == group_name]
@@ -4164,7 +4192,7 @@ def confirm_global_apply(manifest: Dict[str, Any]) -> bool:
                     print(f"    github: {candidate.get('origin_github_repo')}{suffix}")
                 if candidate.get("codex_release_status") and candidate.get("codex_release_status") != "not-detected":
                     print(f"    codex release: {candidate.get('codex_release_status')}")
-        answer = input("Install selected Codex-wide changes now? [y/N] ").strip().lower()
+        answer = input("Install selected changes for this Codex user now? [y/N] ").strip().lower()
         return answer in {"y", "yes"}
     finally:
         if supports_static_menu():
@@ -4500,7 +4528,7 @@ def wizard_apply_project_files(manifest: Dict[str, Any]) -> Tuple[bool, bool]:
 
 
 def wizard_global_candidate_summary(manifest: Dict[str, Any]) -> Dict[str, int]:
-    candidates = global_action_candidates(manifest)
+    candidates = display_global_action_candidates(manifest)
     used_candidates = [candidate for candidate in candidates if candidate.get("used_in_selected_sessions")]
     return {
         "total": len(candidates),
@@ -4514,56 +4542,105 @@ def wizard_global_candidate_summary(manifest: Dict[str, Any]) -> Dict[str, int]:
     }
 
 
+def tooling_candidate_line(candidate: Dict[str, Any]) -> str:
+    action_type = str(candidate.get("type") or "tool")
+    if action_type == "plugin" and candidate.get("bridge"):
+        return f"{candidate.get('id')} -> {candidate.get('bridge_name')} (bridged plugin)"
+    if action_type == "skill":
+        return f"{candidate.get('id')} -> {candidate.get('destination_path')}"
+    if action_type == "mcp":
+        return f"{candidate.get('id')} -> {candidate.get('command')}"
+    return str(candidate.get("id") or candidate.get("label") or "unknown")
+
+
+def persist_wizard_tooling_state(manifest: Dict[str, Any], project_applied: bool) -> bool:
+    try:
+        if project_applied:
+            write_project_artifacts(manifest)
+        else:
+            write_manifest_artifacts(manifest)
+    except HandoffError as exc:
+        print_handoff_error(exc, manifest["target_path"])
+        return False
+    return True
+
+
 def wizard_review_globals(manifest: Dict[str, Any], project_applied: bool) -> bool:
+    all_candidates = annotate_github_codex_releases(global_action_candidates(manifest))
+    manifest["_display_global_action_candidates"] = all_candidates
     summary = wizard_global_candidate_summary(manifest)
-    print("Step 3/3: Codex-Wide Actions")
-    print("These can change ~/.codex and affect every Codex project on this machine.")
+    matched_candidates = conversation_matched_global_candidates(manifest)
+    print("Step 3/3: Tooling Carryover")
     if summary["used"]:
         print(
-            f"Found {summary['used']} conversation-matched candidate(s): "
+            f"Found in selected Claude conversations: "
             f"{summary['used_plugins']} plugin(s), {summary['used_skills']} skill(s), "
             f"{summary['used_mcps']} MCP(s)."
         )
-        additional = summary["total"] - summary["used"]
-        if additional > 0:
-            print(f"{additional} additional candidate(s) from broader Claude inventory are available in the picker via Tab.")
     else:
-        print("No MCP, skill, or plugin install candidates matched the selected Claude transcripts.")
+        print("No MCP, skill, or plugin install candidates matched the selected Claude conversations.")
         print(
             f"Broader Claude inventory has {summary['total']} candidate(s): "
             f"{summary['plugins']} plugin(s), {summary['skills']} skill(s), {summary['mcps']} MCP(s)."
         )
     if summary["total"] == 0:
-        print("No Codex-wide actions found.")
+        print("No tooling carryover actions found.")
         return True
-    default = "y" if summary["used"] else "n"
-    prompt = (
-        "Review conversation-matched Codex-wide actions now? [Y/n] "
-        if default == "y"
-        else "Review broader Codex-wide inventory now? [y/N] "
-    )
-    answer = wizard_answer(prompt, default)
+
+    if matched_candidates:
+        for candidate in matched_candidates[:8]:
+            print(f"  - {tooling_candidate_line(candidate)}")
+        if len(matched_candidates) > 8:
+            print(f"  - +{len(matched_candidates) - 8} more")
+        additional = summary["total"] - len(matched_candidates)
+        if additional > 0:
+            print(f"{additional} additional inventory candidate(s) are available with Customize.")
+        print("Project-only records this in AGENTS.md/manifest without touching ~/.codex.")
+        print("Install for this Codex user writes under ~/.codex and is available in every Codex project for this user.")
+        prompt = "\nCarry over conversation-matched tooling? [Enter=project-only/i install for user/c customize/s skip/q] "
+        answer = wizard_answer(prompt, "project-only")
+    else:
+        prompt = "\nReview broader tooling inventory? [y/N] "
+        answer = wizard_answer(prompt, "n")
+
     if answer in {"q", "quit"}:
-        print("Stopped before Codex-wide actions.")
+        print("Stopped before tooling carryover.")
         return False
-    if answer not in {"y", "yes", "r", "review"}:
-        print("Skipped Codex-wide actions.")
+    if answer in {"s", "skip", "n", "no"}:
+        print("Skipped tooling carryover.")
         return True
-    global_picker(manifest)
+
+    if answer in {"project-only", "p", "record", "r", "yes", "y"} and matched_candidates:
+        set_selected_global_actions(
+            manifest,
+            [str(candidate["id"]) for candidate in matched_candidates],
+            matched_candidates,
+        )
+        if not persist_wizard_tooling_state(manifest, project_applied):
+            return False
+        print("Recorded conversation-matched tooling in the project handoff; no ~/.codex changes were made.")
+        return True
+
+    if answer in {"i", "install", "user", "install-user"} and matched_candidates:
+        set_selected_global_actions(
+            manifest,
+            [str(candidate["id"]) for candidate in matched_candidates],
+            matched_candidates,
+        )
+    elif answer in {"c", "customize", "review", "all"} or not matched_candidates:
+        global_picker(manifest)
+    else:
+        print("Choose Enter, i, c, s, or q.")
+        return wizard_review_globals(manifest, project_applied)
+
     if not selected_global_candidates(manifest):
-        print("No Codex-wide actions selected.")
+        print("No tooling carryover actions selected.")
         return True
     if confirm_global_apply(manifest):
         global_results = apply_selected_global_actions(manifest)
-        try:
-            if project_applied:
-                write_project_artifacts(manifest)
-            else:
-                write_manifest_artifacts(manifest)
-        except HandoffError as exc:
-            print_handoff_error(exc, manifest["target_path"])
+        if not persist_wizard_tooling_state(manifest, project_applied):
             return False
-        print("Codex-wide install results:")
+        print("Install results:")
         for item in global_results:
             label = item.get("id")
             status = item.get("status")
@@ -4571,15 +4648,9 @@ def wizard_review_globals(manifest: Dict[str, Any], project_applied: bool) -> bo
             suffix = f" ({reason})" if reason else ""
             print(f"  - {label}: {status}{suffix}")
     else:
-        try:
-            if project_applied:
-                write_project_artifacts(manifest)
-            else:
-                write_manifest_artifacts(manifest)
-        except HandoffError as exc:
-            print_handoff_error(exc, manifest["target_path"])
+        if not persist_wizard_tooling_state(manifest, project_applied):
             return False
-        print("Selected Codex-wide actions were recorded in the manifest; none were executed.")
+        print("Selected tooling carryover actions were recorded in the project handoff; none were installed.")
     return True
 
 
@@ -4908,7 +4979,7 @@ def print_globals(
     if not candidates:
         print("No Codex-wide install candidates found.")
         return
-    for group_name in ("Recommended", "Review", "Manual / Unsafe"):
+    for group_name in ("Conversation Matched", "Recommended", "Review", "Manual / Unsafe"):
         group_items = [candidate for candidate in candidates if global_candidate_group(candidate) == group_name]
         if not group_items:
             continue
@@ -5188,8 +5259,12 @@ def command_globals_apply(args: argparse.Namespace) -> int:
 
 
 def command_scan(args: argparse.Namespace, *, default_interactive: bool = False) -> int:
-    selection = load_latest_selection(Path(args.path).expanduser().resolve()) if getattr(args, "use_latest_selection", False) else {}
+    project = Path(args.path).expanduser().resolve()
+    use_latest = bool(default_interactive or getattr(args, "use_latest_selection", False))
+    selection = load_latest_selection(project) if use_latest else {}
     selected_session_ids = parse_session_ids(getattr(args, "sessions", None))
+    if default_interactive and not selected_session_ids:
+        selected_session_ids = load_latest_session_ids(project)
     try:
         manifest = build_manifest(
             args.path,
@@ -5214,6 +5289,9 @@ def command_scan(args: argparse.Namespace, *, default_interactive: bool = False)
         print(json.dumps(manifest, indent=2, sort_keys=True))
         return 0
     if default_interactive and sys.stdin.isatty() and not args.no_interactive:
+        manifest["selected_global_action_ids"] = load_latest_global_action_ids(project)
+        manifest["selected_global_actions"] = load_latest_global_actions(project)
+        manifest["global_apply_results"] = load_latest_global_apply_results(project)
         return wizard_flow(manifest)
     print_dry_run(manifest)
     return 0

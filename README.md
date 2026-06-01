@@ -26,7 +26,7 @@ Project-local apply writes `AGENTS.md` plus `.codex/handoff/` artifacts. `AGENTS
 bin/ai-handoff apply /path/to/project --yes --ack-privacy
 ```
 
-Codex-wide MCP, plugin, and skill installs are never executed by default. They can change `~/.codex`, so they affect every Codex project/folder on this machine. The wizard first asks which Claude conversations to use, then applies project-local handoff files, then offers a separate Codex-wide review step. Selected installs can be executed during the wizard after a second confirmation, or later with:
+MCP, plugin, and skill installs are never executed by default. They install under `~/.codex`, so they are available in every Codex project for this OS user. The wizard first asks which Claude conversations to use, then applies project-local handoff files, then shows tooling found in those conversations. The normal choice is simple: record the carryover plan in the project handoff, install it for this Codex user after confirmation, customize exact items, or skip. Selected installs can also be executed later with:
 
 ```bash
 bin/ai-handoff globals /path/to/project
@@ -47,7 +47,7 @@ Claude plugin records without a local cache remain manual. A Claude marketplace 
 
 `globals` groups candidates as Recommended, Review, and Manual/Unsafe. Low-confidence plugin records are hidden by default; add `--include-risky` to inspect them. `globals select` records intent only in `.codex/handoff/manifest.json`; it does not write `AGENTS.md` and does not install Codex-wide changes. `--select` accepts exact candidate IDs, skill names, type aliases such as `skills` or `mcps`, and `all`; bulk selectors skip unsafe/Codex-wide candidates unless `--include-risky` is present.
 
-Selected Claude transcripts are scanned for actual tooling usage. `ai-handoff` records observed `Skill` invocations, `mcp__server__tool` calls, skill metadata, and Claude plugin attribution, then marks matching Codex-wide candidates as `used-in-transcripts`. The wizard defaults to reviewing conversation-matched Codex-wide actions when any exist; the picker opens in `used` view and `Tab` reviews the broader discovered inventory. If you choose more conversations in step 1, the transcript usage and Codex-wide relevance are refreshed before step 3.
+Selected Claude transcripts are scanned for actual tooling usage. `ai-handoff` records observed `Skill` invocations, `mcp__server__tool` calls, skill metadata, and Claude plugin attribution, then marks matching carryover candidates as `used-in-transcripts`. If you choose more conversations in step 1, transcript usage and tooling relevance are refreshed before step 3. The detailed picker is only for Customize; it opens in `used` view when matching candidates exist, and `Tab` reviews the broader discovered inventory.
 
 The wizard completion screen prints what increased handoff confidence: selected conversation count, Claude tooling seen, project files written, Codex-wide installs completed or recorded, and the artifact paths to inspect.
 
