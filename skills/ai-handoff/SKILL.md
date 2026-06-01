@@ -31,7 +31,7 @@ bin/ai-handoff /path/to/project
 
 1. Resolve the target folder and verify it exists.
 2. Run the wizard for normal handoff work. It first asks for the handoff flow. `Claude Code -> Codex` is supported now; `Codex -> Claude Code` is shown as unavailable for a later flow.
-3. In the Claude context step, keep the selected sessions, choose more conversations, or skip Claude context. Changing the conversation selection must refresh transcript usage and Codex-wide candidate relevance before the Codex-wide step.
+3. In the Claude context step, default to the latest three relevant Claude conversations, show the selected conversations, choose more conversations, or skip Claude context. Changing the conversation selection must refresh transcript usage and Codex-wide candidate relevance before the Codex-wide step. If the user selects more conversations, show the resulting selected set instead of only a count.
 4. In the project files step, preview the diff or apply project-local writes:
    - `AGENTS.md`
    - `.codex/handoff/summary.md`

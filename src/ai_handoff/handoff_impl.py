@@ -4893,21 +4893,24 @@ def wizard_select_flow(manifest: Dict[str, Any]) -> bool:
 
 
 def wizard_review_sessions(manifest: Dict[str, Any]) -> bool:
-    show_session_sample = True
     while True:
         sessions = manifest["claude"]["sessions"]
         print(step_heading("Step 1/3", "Claude Context"))
         print(f"Selected {sessions.get('selected_count', 0)} of {sessions.get('found_count', 0)} discovered session(s).")
-        if show_session_sample:
-            for bullet in session_bullets(manifest, limit=3):
+        selected_count = int(sessions.get("selected_count") or 0)
+        if selected_count:
+            print("Selected conversations:")
+            limit = None if selected_count <= 12 else 12
+            for bullet in session_bullets(manifest, limit=limit):
                 print("  " + bullet)
+            if limit is not None and selected_count > limit:
+                print(f"  - +{selected_count - limit} more selected conversation(s)")
         answer = wizard_answer("\nContinue, choose more conversations, skip context, or quit? [Enter/c/s/q] ", "continue")
         if answer in {"q", "quit"}:
             print("No files changed.")
             return False
         if answer in {"c", "choose", "conversations"}:
             session_picker(manifest)
-            show_session_sample = False
             print()
             continue
         if answer in {"s", "skip"}:
@@ -5856,8 +5859,6 @@ def command_scan(args: argparse.Namespace, *, default_interactive: bool = False)
     use_latest = bool(default_interactive or getattr(args, "use_latest_selection", False))
     selection = load_latest_selection(project) if use_latest else {}
     selected_session_ids = parse_session_ids(getattr(args, "sessions", None))
-    if default_interactive and not selected_session_ids:
-        selected_session_ids = load_latest_session_ids(project)
     try:
         manifest = build_manifest(
             args.path,

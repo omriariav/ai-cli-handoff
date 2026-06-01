@@ -1144,29 +1144,30 @@ class AiHandoffTests(unittest.TestCase):
         self.assertEqual(code, 0)
         wizard.assert_called_once()
 
-    def test_default_wizard_reuses_saved_session_selection(self) -> None:
+    def test_default_wizard_uses_recent_three_sessions_not_saved_selection(self) -> None:
         project_sessions = self.home / ".claude" / "projects" / self.module.claude_project_key(self.project)
-        session_2 = project_sessions / "session-2.jsonl"
-        session_2.write_text(
-            json.dumps({"message": {"role": "user", "content": "newer work"}}) + "\n",
-            encoding="utf-8",
-        )
         index_path = project_sessions / "sessions-index.json"
         index = json.loads(index_path.read_text(encoding="utf-8"))
-        index["entries"].append(
-            {
-                "sessionId": "session-2",
-                "fullPath": str(session_2),
-                "firstPrompt": "newer work",
-                "summary": "Newer work",
-                "messageCount": 1,
-                "created": "2026-05-30T12:00:00Z",
-                "modified": "2026-05-30T12:05:00Z",
-                "gitBranch": "main",
-                "projectPath": str(self.project.resolve()),
-                "isSidechain": False,
-            }
-        )
+        for number, hour in ((2, 12), (3, 13), (4, 14)):
+            session_path = project_sessions / f"session-{number}.jsonl"
+            session_path.write_text(
+                json.dumps({"message": {"role": "user", "content": f"newer work {number}"}}) + "\n",
+                encoding="utf-8",
+            )
+            index["entries"].append(
+                {
+                    "sessionId": f"session-{number}",
+                    "fullPath": str(session_path),
+                    "firstPrompt": f"newer work {number}",
+                    "summary": f"Newer work {number}",
+                    "messageCount": 1,
+                    "created": f"2026-05-30T{hour}:00:00Z",
+                    "modified": f"2026-05-30T{hour}:05:00Z",
+                    "gitBranch": "main",
+                    "projectPath": str(self.project.resolve()),
+                    "isSidechain": False,
+                }
+            )
         index_path.write_text(json.dumps(index), encoding="utf-8")
         saved = self.module.build_manifest(str(self.project), selected_session_ids=["session-1"])
         self.module.write_manifest_artifacts(saved)
@@ -1177,7 +1178,10 @@ class AiHandoffTests(unittest.TestCase):
 
         self.assertEqual(code, 0)
         manifest = wizard.call_args.args[0]
-        self.assertEqual(manifest["claude"]["sessions"]["selected_session_ids"], ["session-1"])
+        self.assertEqual(
+            manifest["claude"]["sessions"]["selected_session_ids"],
+            ["session-4", "session-3", "session-2"],
+        )
 
     def test_wizard_claude_context_prompt_has_spacing_and_clear_copy(self) -> None:
         manifest = self.module.build_manifest(str(self.project), last=1)
@@ -1225,7 +1229,7 @@ class AiHandoffTests(unittest.TestCase):
         self.assertEqual(manifest["flow"]["id"], "codex_to_claude")
         self.assertIn("not implemented yet", stdout.getvalue())
 
-    def test_wizard_hides_session_sample_after_picker(self) -> None:
+    def test_wizard_shows_selected_conversations_after_picker(self) -> None:
         manifest = self.module.build_manifest(str(self.project), last=1)
         answers = iter(["c", "q"])
         stdout = io.StringIO()
@@ -1233,16 +1237,33 @@ class AiHandoffTests(unittest.TestCase):
         def fake_answer(prompt: str, default: str = "") -> str:
             return next(answers)
 
+        def fake_session_picker(picker_manifest: Dict[str, Any]) -> bool:
+            base = dict(picker_manifest["claude"]["sessions"]["selected"][0])
+            selected = []
+            for index in range(10):
+                item = dict(base)
+                item["session_id"] = f"session-{index}"
+                item["title"] = f"conversation {index}"
+                item["modified"] = f"2026-05-30T{index:02d}:00:00Z"
+                selected.append(item)
+            picker_manifest["claude"]["sessions"]["selected"] = selected
+            picker_manifest["claude"]["sessions"]["selected_count"] = len(selected)
+            picker_manifest["claude"]["sessions"]["found_count"] = len(selected)
+            picker_manifest["claude"]["sessions"]["selected_session_ids"] = [
+                item["session_id"] for item in selected
+            ]
+            return True
+
         with mock.patch.object(self.module, "wizard_answer", side_effect=fake_answer):
-            with mock.patch.object(self.module, "session_picker", return_value=True):
+            with mock.patch.object(self.module, "session_picker", side_effect=fake_session_picker):
                 with contextlib.redirect_stdout(stdout):
                     continued = self.module.wizard_review_sessions(manifest)
 
         self.assertFalse(continued)
         renders = stdout.getvalue().split("Step 1/3: Claude Context")
         self.assertEqual(len(renders), 3)
-        self.assertIn("  - ", renders[1])
-        self.assertNotIn("  - ", renders[2])
+        self.assertIn("conversation 0", renders[2])
+        self.assertIn("conversation 9", renders[2])
 
     def test_wizard_global_summary_counts_candidates(self) -> None:
         manifest = self.module.build_manifest(str(self.project), last=1)
