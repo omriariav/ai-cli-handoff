@@ -72,6 +72,7 @@ PROJECT_GUIDANCE_NAMES = (
     "README.txt",
     ".mcp.json",
 )
+CLAUDE_SETUP_CAPTURE_KINDS = ("hooks", "rules", "references", "statusline")
 SECRET_FIELD_RE = re.compile(
     r"(?i)(api[_-]?key|token|secret|password|passwd|client_secret|access_token|refresh_token|bearer)"
 )
@@ -400,6 +401,318 @@ def discover_project(project: Path) -> Dict[str, Any]:
             "recent_commits": run_git(project, ["log", "--oneline", "-5"]),
         },
     }
+
+
+def empty_setup_capture() -> Dict[str, List[Dict[str, Any]]]:
+    return {kind: [] for kind in CLAUDE_SETUP_CAPTURE_KINDS}
+
+
+def setting_scope(path: Path, project: Path) -> str:
+    return "project" if path_is_within(path, project) else "user"
+
+
+def claude_setting_paths(project: Path) -> List[Tuple[Path, str]]:
+    home = home_dir()
+    paths: List[Path] = [
+        home / ".claude" / "settings.json",
+        home / ".claude" / "settings.local.json",
+    ]
+    project_settings_dir = project / ".claude"
+    if project_settings_dir.exists():
+        paths.extend(sorted(project_settings_dir.glob("settings*.json")))
+    seen: set = set()
+    result: List[Tuple[Path, str]] = []
+    for path in paths:
+        key = str(path.expanduser())
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append((path, setting_scope(path, project)))
+    return result
+
+
+def dedupe_capture_items(items: List[Dict[str, Any]], keys: Tuple[str, ...]) -> List[Dict[str, Any]]:
+    seen = set()
+    result = []
+    for item in items:
+        key = tuple(str(item.get(part) or "") for part in keys)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(item)
+    return result
+
+
+def capture_count(value: Any) -> int:
+    if isinstance(value, dict):
+        return sum(capture_count(item) for item in value.values()) or 1
+    if isinstance(value, list):
+        return sum(capture_count(item) for item in value) or 1
+    return 1 if value is not None else 0
+
+
+def setting_hooks_entry(path: Path, scope: str, hooks: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(hooks, dict) or not hooks:
+        return None
+    events = sorted(str(key) for key in hooks if key)
+    count = sum(capture_count(hooks.get(event)) for event in hooks)
+    return {
+        "source_path": str(path),
+        "scope": scope,
+        "events": events,
+        "count": count,
+        "status": "captured-review-required",
+        "reason": "Claude hooks can run commands; ai-handoff records them but never enables them automatically.",
+    }
+
+
+def setting_rule_entries(path: Path, scope: str, data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    permissions = data.get("permissions")
+    if not isinstance(permissions, dict):
+        return []
+    entries: List[Dict[str, Any]] = []
+    for key in ("allow", "deny", "ask"):
+        value = permissions.get(key)
+        if value is None:
+            continue
+        values = value if isinstance(value, list) else [value]
+        shown = [truncate(str(redact(item)), 180) for item in values if str(item).strip()]
+        if not shown:
+            continue
+        entries.append(
+            {
+                "source_path": str(path),
+                "scope": scope,
+                "kind": f"permissions.{key}",
+                "count": len(shown),
+                "values": shown[:20],
+                "status": "captured",
+                "reason": "Claude permission rules were recorded for review; project guidance is represented in AGENTS.md.",
+            }
+        )
+    default_mode = permissions.get("defaultMode")
+    if default_mode:
+        entries.append(
+            {
+                "source_path": str(path),
+                "scope": scope,
+                "kind": "permissions.defaultMode",
+                "count": 1,
+                "values": [truncate(str(redact(default_mode)), 180)],
+                "status": "captured",
+                "reason": "Claude permission default mode was recorded for review.",
+            }
+        )
+    return entries
+
+
+def classify_reference_path(reference: str, project: Path) -> Tuple[str, str]:
+    text = reference.strip()
+    if not text:
+        return "unknown", ""
+    if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", text):
+        return "external", text
+    candidate = Path(text).expanduser()
+    if not candidate.is_absolute():
+        candidate = project / text
+    try:
+        resolved = candidate.resolve(strict=False)
+    except OSError:
+        resolved = candidate
+    classification = "project-local" if path_is_within(resolved, project) else "external"
+    return classification, str(resolved)
+
+
+def reference_entry(reference: str, source_path: Path, scope: str, project: Path, source_kind: str) -> Optional[Dict[str, Any]]:
+    text = truncate(redact(str(reference or "").strip()), 240)
+    if not text:
+        return None
+    classification, resolved_path = classify_reference_path(text, project)
+    return {
+        "path": text,
+        "resolved_path": resolved_path,
+        "classification": classification,
+        "source_path": str(source_path),
+        "source_kind": source_kind,
+        "scope": scope,
+        "status": "recorded",
+        "reason": "Reference path recorded for handoff; external references are not copied automatically.",
+    }
+
+
+def extract_markdown_references(text: str) -> List[str]:
+    references = []
+    for match in re.finditer(r"(?<![\w.-])@([~/A-Za-z0-9_.-][A-Za-z0-9_./~@+-]*)", text):
+        value = match.group(1).rstrip(".,);:]")
+        if "/" not in value and "." not in value and not value.startswith(("~", "/")):
+            continue
+        references.append(value)
+    return list(dict.fromkeys(references))
+
+
+def flatten_reference_values(value: Any) -> List[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list):
+        result: List[str] = []
+        for item in value:
+            result.extend(flatten_reference_values(item))
+        return result
+    if isinstance(value, dict):
+        result = []
+        for key in ("path", "file", "url", "href", "reference"):
+            if key in value:
+                result.extend(flatten_reference_values(value.get(key)))
+        return result
+    return []
+
+
+def setting_reference_entries(path: Path, scope: str, data: Dict[str, Any], project: Path) -> List[Dict[str, Any]]:
+    entries: List[Dict[str, Any]] = []
+
+    def walk(value: Any, key_path: str = "") -> None:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                child_key_path = f"{key_path}.{key}" if key_path else str(key)
+                if str(key).lower() in {"reference", "references"}:
+                    for reference in flatten_reference_values(item):
+                        entry = reference_entry(reference, path, scope, project, child_key_path)
+                        if entry:
+                            entries.append(entry)
+                walk(item, child_key_path)
+        elif isinstance(value, list):
+            for item in value:
+                walk(item, key_path)
+
+    walk(data)
+    return entries
+
+
+def setting_statusline_entry(path: Path, scope: str, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    sentinel = object()
+    value = data.get("statusLine", sentinel)
+    if value is sentinel:
+        value = data.get("statusline", sentinel)
+    if value is sentinel:
+        return None
+    return {
+        "source_path": str(path),
+        "scope": scope,
+        "config": redact(value),
+        "count": 1,
+        "status": "captured-only",
+        "reason": "Codex does not support Claude statusline rendering yet; recorded for future migration.",
+    }
+
+
+def add_settings_setup_captures(
+    setup_capture: Dict[str, List[Dict[str, Any]]],
+    path: Path,
+    scope: str,
+    data: Dict[str, Any],
+    project: Path,
+) -> None:
+    hooks = setting_hooks_entry(path, scope, data.get("hooks"))
+    if hooks:
+        setup_capture["hooks"].append(hooks)
+    setup_capture["rules"].extend(setting_rule_entries(path, scope, data))
+    setup_capture["references"].extend(setting_reference_entries(path, scope, data, project))
+    statusline = setting_statusline_entry(path, scope, data)
+    if statusline:
+        setup_capture["statusline"].append(statusline)
+
+
+def add_project_reference_captures(
+    setup_capture: Dict[str, List[Dict[str, Any]]],
+    project: Path,
+) -> None:
+    claude_md = read_text(project / "CLAUDE.md", 40000)
+    if not claude_md:
+        return
+    for reference in extract_markdown_references(claude_md):
+        entry = reference_entry(reference, project / "CLAUDE.md", "project", project, "CLAUDE.md")
+        if entry:
+            setup_capture["references"].append(entry)
+
+
+def add_plugin_setup_captures(
+    setup_capture: Dict[str, List[Dict[str, Any]]],
+    candidate: Dict[str, Any],
+) -> None:
+    paths = [
+        candidate.get("bridge_source_path"),
+        candidate.get("origin_source_path"),
+        candidate.get("install_path"),
+    ]
+    for path_text in paths:
+        if not path_text:
+            continue
+        plugin_path = Path(str(path_text)).expanduser()
+        manifest = load_plugin_manifest(plugin_path)
+        if not isinstance(manifest, dict):
+            continue
+        hooks = setting_hooks_entry(plugin_path / ".claude-plugin" / "plugin.json", "plugin", manifest.get("hooks"))
+        if hooks:
+            hooks["plugin"] = candidate.get("name")
+            setup_capture["hooks"].append(hooks)
+        return
+
+
+def finalize_setup_capture(setup_capture: Dict[str, List[Dict[str, Any]]]) -> Dict[str, Any]:
+    hooks = dedupe_capture_items(setup_capture.get("hooks", []), ("source_path", "plugin"))
+    rules = dedupe_capture_items(setup_capture.get("rules", []), ("source_path", "kind"))
+    references = dedupe_capture_items(setup_capture.get("references", []), ("source_path", "path"))
+    statusline = dedupe_capture_items(setup_capture.get("statusline", []), ("source_path",))
+    summary = {
+        "hooks": sum(int(item.get("count") or 1) for item in hooks),
+        "rules": sum(int(item.get("count") or 1) for item in rules),
+        "references": len(references),
+        "statusline": len(statusline),
+        "project_local_references": sum(1 for item in references if item.get("classification") == "project-local"),
+        "external_references": sum(1 for item in references if item.get("classification") == "external"),
+    }
+    return {
+        "hooks": hooks,
+        "rules": rules,
+        "references": references,
+        "statusline": statusline,
+        "summary": summary,
+    }
+
+
+def setup_capture_summary(manifest_or_config: Dict[str, Any]) -> Dict[str, int]:
+    config = manifest_or_config
+    if "claude" in manifest_or_config:
+        config = manifest_or_config.get("claude", {}).get("config", {})
+    setup = config.get("setup_capture") if isinstance(config, dict) else {}
+    summary = setup.get("summary") if isinstance(setup, dict) else {}
+    return {
+        "hooks": int(summary.get("hooks") or 0) if isinstance(summary, dict) else 0,
+        "rules": int(summary.get("rules") or 0) if isinstance(summary, dict) else 0,
+        "references": int(summary.get("references") or 0) if isinstance(summary, dict) else 0,
+        "statusline": int(summary.get("statusline") or 0) if isinstance(summary, dict) else 0,
+        "project_local_references": int(summary.get("project_local_references") or 0) if isinstance(summary, dict) else 0,
+        "external_references": int(summary.get("external_references") or 0) if isinstance(summary, dict) else 0,
+    }
+
+
+def claude_setup_capture_lines(manifest: Dict[str, Any], prefix: str = "- ") -> List[str]:
+    counts = setup_capture_summary(manifest)
+    rule_note = "CLAUDE.md guidance is represented in AGENTS.md"
+    if counts["rules"]:
+        rule_note += f"; {counts['rules']} Claude permission rule(s) captured"
+    else:
+        rule_note += "; no Claude permission rules captured"
+    return [
+        f"{prefix}Hooks: {counts['hooks']} captured, 0 enabled automatically; review required before recreating hooks.",
+        f"{prefix}Rules: {rule_note}.",
+        (
+            f"{prefix}References: {counts['references']} recorded "
+            f"({counts['project_local_references']} project-local, {counts['external_references']} external); "
+            "external references are not copied automatically."
+        ),
+        f"{prefix}Statusline: {counts['statusline']} captured only; Codex does not use Claude statusline rendering yet.",
+    ]
 
 
 def content_to_text(content: Any) -> Tuple[str, List[str]]:
@@ -2006,10 +2319,17 @@ def discover_claude_config(project: Path, codex: Dict[str, Any]) -> Dict[str, An
         candidate["already_in_codex"] = name in set(codex.get("mcp_names") or [])
         candidate["proposed_command"] = mcp_command(name, candidate["config"])
     claude_settings = []
-    for path in sorted((project / ".claude").glob("settings*.json")) if (project / ".claude").exists() else []:
+    settings_files = []
+    setup_capture = empty_setup_capture()
+    for path, scope in claude_setting_paths(project):
         data = load_json(path)
         if isinstance(data, dict):
-            claude_settings.append({"path": str(path), "config": redact(data)})
+            entry = {"path": str(path), "scope": scope, "config": redact(data)}
+            settings_files.append(entry)
+            if scope == "project":
+                claude_settings.append(entry)
+            add_settings_setup_captures(setup_capture, path, scope, data, project)
+    add_project_reference_captures(setup_capture, project)
     claude_skills = skill_names(home / ".claude" / "skills")
     codex_skills = skill_names(home / ".codex" / "skills")
     skill_candidates = []
@@ -2054,9 +2374,12 @@ def discover_claude_config(project: Path, codex: Dict[str, Any]) -> Dict[str, An
         candidate.update(candidate_scope_and_risk("skill", candidate, project))
     for candidate in plugin_candidates:
         candidate.update(candidate_scope_and_risk("plugin", candidate, project))
+        add_plugin_setup_captures(setup_capture, candidate)
     return {
         "mcp_candidates": mcp_candidates,
         "project_settings": claude_settings,
+        "settings_files": settings_files,
+        "setup_capture": finalize_setup_capture(setup_capture),
         "skill_candidates": skill_candidates,
         "plugin_candidates": plugin_candidates,
     }
@@ -2238,6 +2561,8 @@ def build_manifest(
     claude_config = discover_claude_config(project, codex) if not init_only else {
         "mcp_candidates": [],
         "project_settings": [],
+        "settings_files": [],
+        "setup_capture": finalize_setup_capture(empty_setup_capture()),
         "skill_candidates": [],
         "plugin_candidates": [],
     }
@@ -2255,6 +2580,13 @@ def build_manifest(
         "version": VERSION,
         "run_id": run_id,
         "generated_at": generated_at,
+        "flow": {
+            "id": "claude_to_codex",
+            "label": "Claude Code -> Codex",
+            "source": "Claude Code",
+            "target": "Codex",
+            "status": "available",
+        },
         "suggested_goal": f"Prepare {project} for Codex handoff from Claude Code context.",
         "target_path": str(project),
         "selection": effective_selection,
@@ -2345,8 +2677,12 @@ def privacy_metadata(manifest: Dict[str, Any]) -> Dict[str, Any]:
         + len(config.get("skill_candidates") or [])
         + len(config.get("plugin_candidates") or [])
     )
+    setup_counts = setup_capture_summary(config)
+    setup_capture_count = (
+        setup_counts["hooks"] + setup_counts["rules"] + setup_counts["references"] + setup_counts["statusline"]
+    )
     close_match_count = len(manifest["claude"]["sessions"].get("close_project_matches") or [])
-    contains_local_inventory = bool(global_inventory_count or close_match_count)
+    contains_local_inventory = bool(global_inventory_count or setup_capture_count or close_match_count)
     written_context = [
         "Project path and handoff metadata",
     ]
@@ -2355,6 +2691,8 @@ def privacy_metadata(manifest: Dict[str, Any]) -> Dict[str, Any]:
         written_context.append("Recent prompts, assistant notes, commands, and local transcript paths in manifest JSON")
     if contains_local_inventory:
         written_context.append("Claude/Codex MCP, skill, plugin, and nearby project inventory with local paths")
+    if setup_capture_count:
+        written_context.append("Claude hooks, permission rules, references, and statusline settings captured for review")
     if include_transcripts:
         written_context.append("Fuller transcript excerpts")
     usage_summary = manifest["claude"]["sessions"].get("usage_summary") or {}
@@ -2366,6 +2704,7 @@ def privacy_metadata(manifest: Dict[str, Any]) -> Dict[str, Any]:
         "includes_transcript_excerpts": include_transcripts,
         "contains_local_inventory": contains_local_inventory,
         "global_inventory_count": global_inventory_count,
+        "setup_capture_count": setup_capture_count,
         "nearby_project_match_count": close_match_count,
         "ack_required_for_apply": selected_count > 0 or contains_local_inventory,
         "redaction": "best-effort",
@@ -2503,10 +2842,12 @@ def render_summary(manifest: Dict[str, Any]) -> str:
     project = manifest["project"]
     codex = manifest["codex"]
     sessions = manifest["claude"]["sessions"]
+    flow = manifest.get("flow") if isinstance(manifest.get("flow"), dict) else {}
     lines = [
         "# AI Handoff Summary",
         "",
         f"Generated: {manifest['generated_at']}",
+        f"Flow: {flow.get('label') or 'Claude Code -> Codex'}",
         f"Project: {manifest['target_path']}",
         f"Suggested Codex goal: {manifest['suggested_goal']}",
         "",
@@ -2538,6 +2879,8 @@ def render_summary(manifest: Dict[str, Any]) -> str:
                 f"- Plugins: {usage_kind_names(usage_summary, 'plugins')}",
             ]
         )
+    lines.extend(["", "## Claude Setup Captured"])
+    lines.extend(claude_setup_capture_lines(manifest))
     lines.extend(["", "## Commands And Entrypoints"])
     scripts = project.get("package_scripts") or {}
     if scripts:
@@ -2566,6 +2909,7 @@ def render_summary(manifest: Dict[str, Any]) -> str:
 
 def render_agents_managed_section(manifest: Dict[str, Any]) -> str:
     project = manifest["project"]
+    flow = manifest.get("flow") if isinstance(manifest.get("flow"), dict) else {}
     lines = [
         MANAGED_START,
         "# Codex Handoff Context",
@@ -2574,6 +2918,7 @@ def render_agents_managed_section(manifest: Dict[str, Any]) -> str:
         "Codex loads AGENTS.md automatically when it works in this project; use this managed section as handoff context before starting work.",
         "",
         f"Generated: {manifest['generated_at']}",
+        f"Flow: {flow.get('label') or 'Claude Code -> Codex'}",
         f"Source project: {manifest['target_path']}",
         f"Suggested goal: {manifest['suggested_goal']}",
         "",
@@ -2605,6 +2950,8 @@ def render_agents_managed_section(manifest: Dict[str, Any]) -> str:
                 f"- Plugins: {usage_kind_names(usage_summary, 'plugins')}",
             ]
         )
+    lines.extend(["", "## Claude Setup Captured"])
+    lines.extend(claude_setup_capture_lines(manifest))
     lines.extend(["", "## Codex Tooling Prepared"])
     lines.extend(codex_tooling_status_lines(manifest))
     lines.extend(["", "## Commands Detected"])
@@ -2736,6 +3083,8 @@ def print_dry_run(manifest: Dict[str, Any]) -> None:
     print("AI Handoff dry run")
     print()
     print(f"Project: {manifest['target_path']}")
+    flow = manifest.get("flow") if isinstance(manifest.get("flow"), dict) else {}
+    print(f"Flow: {flow.get('label') or 'Claude Code -> Codex'}")
     print(f"Goal: {manifest['suggested_goal']}")
     confidence = manifest.get("handoff_confidence", {})
     print(f"Handoff confidence: {confidence.get('level', 'unknown')} - {confidence.get('reason', '')}")
@@ -2765,6 +3114,12 @@ def print_dry_run(manifest: Dict[str, Any]) -> None:
     print(f"  [info] MCP candidates: {len(config.get('mcp_candidates', []))}")
     print(f"  [info] skill candidates: {len(config.get('skill_candidates', []))}")
     print(f"  [info] plugin candidates: {len(config.get('plugin_candidates', []))}")
+    setup_counts = setup_capture_summary(config)
+    print(
+        "  [info] captured Claude setup: "
+        f"{setup_counts['hooks']} hook(s), {setup_counts['rules']} rule(s), "
+        f"{setup_counts['references']} reference(s), {setup_counts['statusline']} statusline config(s)"
+    )
     diagnostics = manifest.get("diagnostics") or []
     if diagnostics:
         print()
@@ -3727,6 +4082,7 @@ def render_global_picker(
     filter_text: str = "",
     mode: str = "all",
     page_size: int = GLOBAL_PICKER_PAGE_SIZE,
+    title: str = "Full Claude Setup",
 ) -> str:
     all_candidates = display_global_action_candidates(manifest)
     candidates = visible_global_candidates(manifest, filter_text=filter_text, mode=mode)
@@ -3739,8 +4095,9 @@ def render_global_picker(
     current_page = 1 if not candidates else (start // page_size) + 1
     lines = [
         "",
-        "Customize Tooling Carryover",
-        "Installs run for this Codex user under ~/.codex, so they are available in every Codex project after final confirmation.",
+        title,
+        "Review everything configured in Claude, including tools not seen in the selected conversations.",
+        "Installs run for this Codex user under ~/.codex and become available in every Codex project after final confirmation.",
         (
             f"View: {mode} | Filter: {filter_text or 'none'} | "
             f"Showing: {start + 1 if candidates else 0}-{end} of {len(candidates)} | "
@@ -3900,7 +4257,7 @@ def current_global_page_candidates(
 def global_picker_help() -> str:
     return "\n".join(
         [
-            "Codex-Wide Install Picker Help",
+            "Full Claude Setup Picker Help",
             "",
             "Up/k and Down/j: move cursor",
             "f and b: page forward/back",
@@ -3922,7 +4279,7 @@ def global_picker_help() -> str:
     )
 
 
-def global_picker(manifest: Dict[str, Any]) -> None:
+def global_picker(manifest: Dict[str, Any], initial_mode: Optional[str] = None, title: str = "Full Claude Setup") -> None:
     all_candidates = annotate_github_codex_releases(global_action_candidates(manifest))
     manifest["_display_global_action_candidates"] = all_candidates
     if not all_candidates:
@@ -3931,7 +4288,9 @@ def global_picker(manifest: Dict[str, Any]) -> None:
     selected_ids = list(manifest.get("selected_global_action_ids") or [])
     cursor = 0
     filter_text = ""
-    mode = initial_global_picker_mode(manifest)
+    mode = initial_mode or initial_global_picker_mode(manifest)
+    if mode not in GLOBAL_PICKER_MODES:
+        mode = initial_global_picker_mode(manifest)
     while True:
         page_size = global_picker_page_size()
         candidates = visible_global_candidates(manifest, filter_text=filter_text, mode=mode)
@@ -3947,6 +4306,7 @@ def global_picker(manifest: Dict[str, Any]) -> None:
                 filter_text=filter_text,
                 mode=mode,
                 page_size=page_size,
+                title=title,
             ),
             flush=True,
         )
@@ -4482,8 +4842,10 @@ def wizard_answer(prompt: str, default: str = "") -> str:
 def print_wizard_header(manifest: Dict[str, Any]) -> None:
     sessions = manifest["claude"]["sessions"]
     confidence = manifest.get("handoff_confidence", {})
+    flow = manifest.get("flow") if isinstance(manifest.get("flow"), dict) else {}
     print(color_text("AI Handoff Wizard", ANSI_BOLD))
     print(f"Project: {manifest['target_path']}")
+    print(f"Flow: {flow.get('label') or 'Claude Code -> Codex'}")
     print(f"Confidence: {confidence.get('level', 'unknown')} - {confidence.get('reason', '')}")
     print(
         f"Claude sessions: {sessions.get('found_count', 0)} found, "
@@ -4494,6 +4856,40 @@ def print_wizard_header(manifest: Dict[str, Any]) -> None:
     if used_plugins != "none":
         print(f"Transcript-used plugins: {used_plugins}")
     print()
+
+
+def wizard_select_flow(manifest: Dict[str, Any]) -> bool:
+    while True:
+        print(step_heading("Flow", "Handoff Direction"))
+        print("  1. Claude Code -> Codex")
+        print("     Prepare Codex from Claude conversations, CLAUDE.md, and Claude setup.")
+        print("  2. Codex -> Claude Code")
+        print("     Not available yet; planned for a later flow.")
+        answer = wizard_answer("\nChoose handoff flow [1/q] ", "")
+        if answer in {"q", "quit"}:
+            print("No files changed.")
+            return False
+        if answer in {"1", "claude", "claude-to-codex", "claude->codex", "claude=>codex"}:
+            manifest["flow"] = {
+                "id": "claude_to_codex",
+                "label": "Claude Code -> Codex",
+                "source": "Claude Code",
+                "target": "Codex",
+                "status": "selected",
+            }
+            print()
+            return True
+        if answer in {"2", "codex", "codex-to-claude", "codex->claude", "codex=>claude"}:
+            manifest["flow"] = {
+                "id": "codex_to_claude",
+                "label": "Codex -> Claude Code",
+                "source": "Codex",
+                "target": "Claude Code",
+                "status": "unavailable",
+            }
+            print("Codex -> Claude Code handoff is not implemented yet. No files changed.")
+            return False
+        print("Choose 1 or q.")
 
 
 def wizard_review_sessions(manifest: Dict[str, Any]) -> bool:
@@ -4651,16 +5047,19 @@ def parse_tooling_selection(answer: str, candidates: List[Dict[str, Any]]) -> Tu
 
 def wizard_select_matched_tooling(candidates: List[Dict[str, Any]]) -> Tuple[str, List[Dict[str, Any]]]:
     while True:
-        answer = wizard_answer("\nSelect tools to carry over [Enter=all/1,3/c customize/s skip/q] ", "all")
+        answer = wizard_answer(
+            "\nSelect conversation-detected carryover [Enter=all/1,3/e expand full setup/s skip/q] ",
+            "all",
+        )
         if answer in {"q", "quit"}:
             return "quit", []
         if answer in {"s", "skip", "n", "no"}:
             return "skip", []
-        if answer in {"c", "customize", "review"}:
-            return "customize", []
+        if answer in {"e", "expand", "full", "global", "setup", "c", "customize", "review"}:
+            return "expand", []
         selected, error = parse_tooling_selection(answer, candidates)
         if error:
-            print(f"{error}. Choose Enter, numbers like 1,3, c, s, or q.")
+            print(f"{error}. Choose Enter, numbers like 1,3, e, s, or q.")
             continue
         return "selected", selected
 
@@ -4706,7 +5105,7 @@ def wizard_apply_tooling_selection(
 
 
 def render_tooling_progress(lines: List[str]) -> str:
-    rendered = [step_heading("Step 3/3", "Tooling Carryover"), ""]
+    rendered = [step_heading("Step 3/3", "Tooling & Claude Setup Carryover"), ""]
     rendered.extend(f"  {color_text('[info]', ANSI_CYAN)} {line}" for line in lines)
     return "\n".join(rendered)
 
@@ -4736,13 +5135,14 @@ def wizard_github_progress(lines: List[str], index: int, total: int, candidate: 
 def print_tooling_summary_header() -> None:
     if supports_static_menu():
         sys.stdout.write(ANSI_CLEAR_VIEWPORT)
-    print(step_heading("Step 3/3", "Tooling Carryover"))
+    print(step_heading("Step 3/3", "Tooling & Claude Setup Carryover"))
 
 
 def wizard_review_globals(manifest: Dict[str, Any], project_applied: bool) -> bool:
     progress_lines: List[str] = []
     draw_tooling_progress(progress_lines)
     wizard_tooling_progress(progress_lines, "Scanning selected Claude conversations for MCP, skill, and plugin usage...")
+    wizard_tooling_progress(progress_lines, "Capturing Claude hooks, rules, references, and statusline configuration...")
     base_candidates = global_action_candidates(manifest)
     github_check_count = sum(1 for candidate in base_candidates if candidate.get("origin_github_repo"))
     wizard_tooling_progress(
@@ -4764,36 +5164,47 @@ def wizard_review_globals(manifest: Dict[str, Any], project_applied: bool) -> bo
     print_tooling_summary_header()
     print()
     if summary["used"]:
+        print("Detected from selected conversations:")
+        print("These were actually used in the Claude sessions you selected.")
         print(
-            f"Found in selected Claude conversations: "
+            f"Found {summary['used']} carryover action(s): "
             f"{summary['used_plugins']} plugin(s), {summary['used_skills']} skill(s), "
             f"{summary['used_mcps']} MCP(s)."
         )
     else:
-        print("No MCP, skill, or plugin install candidates matched the selected Claude conversations.")
+        print("Detected from selected conversations:")
+        print("No installable MCP, skill, or plugin actions matched the selected Claude conversations.")
         print(
-            f"Broader Claude inventory has {summary['total']} candidate(s): "
+            f"Full Claude setup has {summary['total']} candidate(s): "
             f"{summary['plugins']} plugin(s), {summary['skills']} skill(s), {summary['mcps']} MCP(s)."
         )
+    print()
+    print("Captured from Claude setup:")
+    print("These were found in Claude config/project context, but were not necessarily used.")
+    for line in claude_setup_capture_lines(manifest, prefix="  - "):
+        print(line)
     if summary["total"] == 0:
         print("No tooling carryover actions found.")
         return True
 
     if matched_candidates:
+        print()
         for index, candidate in enumerate(matched_candidates[:8], start=1):
             print(f"  {index}. {tooling_candidate_line(candidate)}")
         if len(matched_candidates) > 8:
             print(f"  - +{len(matched_candidates) - 8} more")
         additional = summary["total"] - len(matched_candidates)
         if additional > 0:
-            print(f"{additional} additional inventory candidate(s) are available with Customize.")
+            print()
+            print(f"Expand to full Claude setup: {additional} additional candidate(s) not seen in selected conversations.")
+            print("Use this if you want Codex to feel closer to your full Claude environment.")
         print("Project-only records this in AGENTS.md/manifest without touching ~/.codex.")
         print("Install for this Codex user writes under ~/.codex and is available in every Codex project for this user.")
         action, selected = wizard_select_matched_tooling(matched_candidates)
     else:
-        prompt = "\nReview broader tooling inventory? [y/N] "
+        prompt = "\nExpand to full Claude setup? [y/N] "
         answer = wizard_answer(prompt, "n")
-        action = "customize" if answer in {"y", "yes", "r", "review"} else answer
+        action = "expand" if answer in {"y", "yes", "r", "review", "e", "expand"} else answer
         selected = []
 
     if action in {"q", "quit"}:
@@ -4806,10 +5217,10 @@ def wizard_review_globals(manifest: Dict[str, Any], project_applied: bool) -> bo
     if action == "selected" and selected:
         return wizard_apply_tooling_selection(manifest, project_applied, selected)
 
-    if action in {"c", "customize", "review", "all"} or not matched_candidates:
-        global_picker(manifest)
+    if action in {"e", "expand", "c", "customize", "review", "all"} or not matched_candidates:
+        global_picker(manifest, initial_mode="all", title="Full Claude Setup")
     else:
-        print("Choose Enter, numbers, c, s, or q.")
+        print("Choose Enter, numbers, e, s, or q.")
         return wizard_review_globals(manifest, project_applied)
 
     if not selected_global_candidates(manifest):
@@ -4882,6 +5293,8 @@ def print_wizard_completion(manifest: Dict[str, Any]) -> None:
 
 def wizard_flow(manifest: Dict[str, Any]) -> int:
     print_wizard_header(manifest)
+    if not wizard_select_flow(manifest):
+        return 0
     if not wizard_review_sessions(manifest):
         return 0
     continue_flow, project_applied = wizard_apply_project_files(manifest)
@@ -5101,6 +5514,7 @@ def command_privacy(args: argparse.Namespace) -> int:
     print("Counts:")
     print(f"  - selected Claude sessions: {privacy.get('selected_session_count', 0)}")
     print(f"  - global inventory candidates: {privacy.get('global_inventory_count', 0)}")
+    print(f"  - captured Claude setup items: {privacy.get('setup_capture_count', 0)}")
     print(f"  - nearby Claude project matches: {privacy.get('nearby_project_match_count', 0)}")
     print()
     print("Review the full manifest diff with:")

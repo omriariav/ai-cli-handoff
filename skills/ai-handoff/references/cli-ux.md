@@ -65,11 +65,21 @@ Conversation recovery must not depend on one exact Claude project folder. `conve
 
 ## Wizard Flow
 
-`ai-handoff <path>` is optimized for a one-time handoff. It should read as a wizard, not a dashboard:
+`ai-handoff <path>` is optimized for a one-time handoff. It should read as a wizard, not a dashboard. The wizard starts with a handoff direction choice:
+
+- `Claude Code -> Codex`: available now.
+- `Codex -> Claude Code`: shown as a future flow and exits without writing files for now.
 
 1. Claude context: show found/selected sessions and transcript-used tools. Let the user continue, choose more conversations, skip context, or quit. After the user returns from the conversation picker, show only the selected/found count instead of repeating the earlier sample sessions.
 2. Project files: show the exact project-local files, offer preview diff, apply, skip, or quit.
-3. Tooling carryover: print the `Step 3/3` header before any slow compatibility checks, then show bounded progress lines so the user knows scanning and GitHub/native-Codex checks are running. Summarize conversation-matched MCPs, skills, and plugins first. Do not open the detailed install picker by default. List matched tools with stable numbers and bridge/native reasoning, let the user choose `Enter=all` or specific numbers, then ask whether to record in project handoff only or install for this Codex user. Broader Claude inventory counts can be mentioned as secondary context and remain available through Customize, but the primary Step 3 question should be about tooling relevant to the selected conversations.
+3. Tooling and Claude setup carryover: print the `Step 3/3` header before any slow compatibility checks, then show bounded progress lines so the user knows scanning and GitHub/native-Codex checks are running. Summarize conversation-matched MCPs, skills, and plugins first under `Detected from selected conversations`. Do not open the detailed install picker by default. List matched tools with stable numbers and bridge/native reasoning, let the user choose `Enter=all` or specific numbers, then ask whether to record in project handoff only or install for this Codex user. Broader Claude setup counts should be secondary and framed as `Expand to full Claude setup`, not as the main path. The expansion reviews everything configured in Claude, including tools not seen in the selected conversations.
+
+Step 3 should also show captured-only Claude setup:
+
+- Hooks: captured, review required, never enabled automatically because they can run commands.
+- Rules: project guidance is merged into AGENTS.md; Claude permission rules are recorded for review.
+- References: project-local and external paths are recorded; external references are not copied automatically.
+- Statusline: captured only; Codex does not support Claude statusline rendering yet.
 
 The wizard must keep installs behind a second confirmation that explicitly says it can change `~/.codex` and make tooling available in every Codex project for this OS user. Codex CLI currently exposes these installs as user-level, not project-local; project-only means recording intent and context in AGENTS.md/manifest without installing.
 

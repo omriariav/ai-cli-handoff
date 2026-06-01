@@ -259,6 +259,7 @@ class AiHandoffTests(unittest.TestCase):
     def test_build_manifest_discovers_and_redacts(self) -> None:
         manifest = self.module.build_manifest(str(self.project), last=1)
 
+        self.assertEqual(manifest["flow"]["id"], "claude_to_codex")
         self.assertEqual(manifest["codex"]["trust_level"], "trusted")
         self.assertEqual(manifest["claude"]["sessions"]["selected_count"], 1)
         self.assertEqual(manifest["claude"]["sessions"]["selected"][0]["session_id"], "session-1")
@@ -275,6 +276,38 @@ class AiHandoffTests(unittest.TestCase):
 
         prompt = manifest["claude"]["sessions"]["selected"][0]["transcript"]["user_prompts"][0]
         self.assertIn("TOKEN=<redacted>", prompt)
+
+    def test_claude_setup_capture_records_hooks_rules_references_and_statusline(self) -> None:
+        (self.project / "CLAUDE.md").write_text(
+            "# CLAUDE.md\n\nUse @docs/runbook.md and @/tmp/outside.md.\n",
+            encoding="utf-8",
+        )
+        (self.project / "docs").mkdir()
+        (self.project / "docs" / "runbook.md").write_text("Runbook\n", encoding="utf-8")
+        settings = {
+            "permissions": {
+                "allow": ["Bash(pytest:*)"],
+                "deny": ["Bash(rm:*)"],
+                "defaultMode": "acceptEdits",
+            },
+            "hooks": {"UserPromptSubmit": [{"matcher": "*", "hooks": [{"type": "command", "command": "echo hi"}]}]},
+            "references": ["docs/runbook.md", "/tmp/outside.md"],
+            "statusLine": {"type": "command", "command": "echo status"},
+        }
+        (self.project / ".claude" / "settings.local.json").write_text(json.dumps(settings), encoding="utf-8")
+
+        manifest = self.module.build_manifest(str(self.project), last=1)
+        capture = manifest["claude"]["config"]["setup_capture"]
+        counts = capture["summary"]
+
+        self.assertGreaterEqual(counts["hooks"], 1)
+        self.assertGreaterEqual(counts["rules"], 3)
+        self.assertGreaterEqual(counts["references"], 2)
+        self.assertEqual(counts["statusline"], 1)
+        self.assertTrue(any(item["classification"] == "project-local" for item in capture["references"]))
+        self.assertTrue(any(item["classification"] == "external" for item in capture["references"]))
+        self.assertIn("Claude Setup Captured", self.module.render_summary(manifest))
+        self.assertIn("Statusline:", self.module.render_agents_managed_section(manifest))
 
     def test_transcript_usage_annotates_global_candidates(self) -> None:
         self.append_transcript_usage_events()
@@ -1164,6 +1197,34 @@ class AiHandoffTests(unittest.TestCase):
             ["\nContinue, choose more conversations, skip context, or quit? [Enter/c/s/q] "],
         )
 
+    def test_wizard_flow_requires_user_direction_choice(self) -> None:
+        manifest = self.module.build_manifest(str(self.project), last=1)
+        prompts = []
+
+        def fake_answer(prompt: str, default: str = "") -> str:
+            prompts.append(prompt)
+            return "1"
+
+        with mock.patch.object(self.module, "wizard_answer", side_effect=fake_answer):
+            with contextlib.redirect_stdout(io.StringIO()):
+                continued = self.module.wizard_select_flow(manifest)
+
+        self.assertTrue(continued)
+        self.assertEqual(manifest["flow"]["id"], "claude_to_codex")
+        self.assertEqual(prompts, ["\nChoose handoff flow [1/q] "])
+
+    def test_wizard_flow_rejects_reverse_direction_for_now(self) -> None:
+        manifest = self.module.build_manifest(str(self.project), last=1)
+        stdout = io.StringIO()
+
+        with mock.patch.object(self.module, "wizard_answer", return_value="2"):
+            with contextlib.redirect_stdout(stdout):
+                continued = self.module.wizard_select_flow(manifest)
+
+        self.assertFalse(continued)
+        self.assertEqual(manifest["flow"]["id"], "codex_to_claude")
+        self.assertIn("not implemented yet", stdout.getvalue())
+
     def test_wizard_hides_session_sample_after_picker(self) -> None:
         manifest = self.module.build_manifest(str(self.project), last=1)
         answers = iter(["c", "q"])
@@ -1214,15 +1275,17 @@ class AiHandoffTests(unittest.TestCase):
                 continued = self.module.wizard_review_globals(manifest, project_applied=False)
 
         self.assertTrue(continued)
-        self.assertIn("Step 3/3: Tooling Carryover", stdout.getvalue())
+        self.assertIn("Step 3/3: Tooling & Claude Setup Carryover", stdout.getvalue())
         self.assertIn("Scanning selected Claude conversations", stdout.getvalue())
+        self.assertIn("Capturing Claude hooks, rules, references, and statusline", stdout.getvalue())
         self.assertIn("possible carryover action", stdout.getvalue())
         self.assertIn("Ready:", stdout.getvalue())
-        self.assertIn("Found in selected Claude conversations", stdout.getvalue())
-        self.assertIn("additional inventory candidate(s) are available with Customize", stdout.getvalue())
+        self.assertIn("Detected from selected conversations", stdout.getvalue())
+        self.assertIn("Captured from Claude setup", stdout.getvalue())
+        self.assertIn("Expand to full Claude setup", stdout.getvalue())
         self.assertEqual(
             prompts,
-            ["\nSelect tools to carry over [Enter=all/1,3/c customize/s skip/q] "],
+            ["\nSelect conversation-detected carryover [Enter=all/1,3/e expand full setup/s skip/q] "],
         )
 
     def test_wizard_tooling_project_only_records_matched_actions(self) -> None:
@@ -1263,7 +1326,7 @@ class AiHandoffTests(unittest.TestCase):
 
         rendered = stdout.getvalue()
         self.assertTrue(rendered.startswith(self.module.ANSI_CLEAR_VIEWPORT))
-        self.assertIn("Step 3/3: Tooling Carryover", rendered)
+        self.assertIn("Step 3/3: Tooling & Claude Setup Carryover", rendered)
         self.assertIn("[info] Scanning selected Claude conversations", rendered)
 
     def test_color_text_uses_ansi_only_when_supported(self) -> None:
