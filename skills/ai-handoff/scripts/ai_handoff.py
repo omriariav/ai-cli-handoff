@@ -3966,6 +3966,14 @@ def confirm_global_apply(manifest: Dict[str, Any]) -> bool:
                 print(f"    {truncate(str(candidate['label']), 160)}")
                 if detail:
                     print(f"    {truncate(detail, 160)}")
+                if candidate.get("origin_source_url"):
+                    print(f"    source: {truncate(str(candidate.get('origin_source_url')), 160)}")
+                if candidate.get("origin_github_repo"):
+                    source_path = str(candidate.get("origin_subdir") or "").strip("/")
+                    suffix = f" ({source_path})" if source_path else ""
+                    print(f"    github: {candidate.get('origin_github_repo')}{suffix}")
+                if candidate.get("codex_release_status") and candidate.get("codex_release_status") != "not-detected":
+                    print(f"    codex release: {candidate.get('codex_release_status')}")
         answer = input("Install selected Codex-wide changes now? [y/N] ").strip().lower()
         return answer in {"y", "yes"}
     finally:
