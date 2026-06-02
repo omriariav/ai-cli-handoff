@@ -35,7 +35,7 @@ except Exception:  # pragma: no cover - Python < 3.11 fallback
     tomllib = None  # type: ignore[assignment]
 
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 MANAGED_START = "<!-- ai-handoff:start -->"
 MANAGED_END = "<!-- ai-handoff:end -->"
 DEFAULT_SELECTION = {
@@ -769,6 +769,10 @@ def content_to_text(content: Any) -> Tuple[str, List[str]]:
     return redact("\n".join(texts)), [redact(command) for command in commands]
 
 
+def content_has_tool_result(content: Any) -> bool:
+    return isinstance(content, list) and any(isinstance(item, dict) and item.get("type") == "tool_result" for item in content)
+
+
 USAGE_KINDS = ("tools", "mcp_servers", "skills", "plugins")
 
 
@@ -939,10 +943,14 @@ def summarize_transcript(path: Path, include_excerpts: bool = False, max_bytes: 
                 if role is None:
                     role = obj.get("type")
                     content = obj.get("content") or obj.get("attachment")
+                if role == "user" and content_has_tool_result(content):
+                    continue
                 text, commands = content_to_text(content)
                 if commands:
                     summary["commands"].extend(truncate(command, 220) for command in commands[:20])
                 if not text:
+                    continue
+                if is_synthetic_session_prompt(text):
                     continue
                 if role == "user":
                     summary["user_prompts"].append(truncate(text, 260))
@@ -1036,11 +1044,30 @@ def load_plugin_manifest(plugin_dir: Path) -> Optional[Dict[str, Any]]:
     return None
 
 
+def load_claude_plugin_manifest(plugin_dir: Optional[Path]) -> Optional[Dict[str, Any]]:
+    if not plugin_dir:
+        return None
+    manifest = load_json(plugin_dir / ".claude-plugin" / "plugin.json")
+    return manifest if isinstance(manifest, dict) else None
+
+
+def plugin_manifest_version(manifest: Optional[Dict[str, Any]]) -> str:
+    if not isinstance(manifest, dict):
+        return ""
+    return str(manifest.get("version") or "")
+
+
 def git_origin_from_config(root: Path) -> str:
-    config = root / ".git" / "config"
-    try:
-        text = config.read_text(encoding="utf-8", errors="replace")
-    except OSError:
+    candidates = [root, *root.parents]
+    text = ""
+    for candidate in candidates:
+        config = candidate / ".git" / "config"
+        try:
+            text = config.read_text(encoding="utf-8", errors="replace")
+            break
+        except OSError:
+            continue
+    if not text:
         return ""
     in_origin = False
     first_url = ""
@@ -1106,6 +1133,8 @@ def source_path_from_entry(root: Optional[Path], source: Any, plugin_name: str) 
         rel = source
     elif isinstance(source, dict):
         rel = str(source.get("path") or "")
+        if not rel and (source.get("url") or source.get("repo")):
+            return None
     if not rel and plugin_name:
         rel = f"./plugins/{plugin_name}"
     if not rel or re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", rel):
@@ -1115,7 +1144,12 @@ def source_path_from_entry(root: Optional[Path], source: Any, plugin_name: str) 
 
 def source_url_from_entry(source: Any) -> str:
     if isinstance(source, dict):
-        return str(source.get("url") or source.get("repo") or "")
+        if source.get("url"):
+            return str(source.get("url") or "")
+        if source.get("repo"):
+            repo = str(source.get("repo") or "")
+            return f"https://github.com/{repo}.git" if github_repo_from_url(repo) else repo
+        return ""
     if isinstance(source, str) and re.match(r"^(git@|https?://|ssh://|git://)", source):
         return source
     return ""
@@ -1246,6 +1280,10 @@ def annotate_github_codex_release(candidate: Dict[str, Any]) -> Dict[str, Any]:
     if exists:
         candidate["codex_release_status"] = "github-native-codex-manifest"
         candidate["codex_release_evidence"] = f"GitHub contains {manifest_url}"
+        candidate["blocked_reason"] = (
+            "native Codex plugin metadata was found on GitHub; review/install the native Codex package instead of "
+            "auto-bridging this Claude plugin"
+        )
         if "codex-native" not in badges:
             badges.append("codex-native")
         candidate["risk_badges"] = badges
@@ -1268,8 +1306,15 @@ def annotate_github_codex_releases(candidates: List[Dict[str, Any]], progress: O
         if candidate_copy.get("origin_github_repo"):
             checked += 1
             if progress:
-                progress(checked, checkable_total, candidate_copy)
-        annotated.append(annotate_github_codex_release(candidate_copy))
+                checking = dict(candidate_copy)
+                checking["_github_progress_phase"] = "checking"
+                progress(checked, checkable_total, checking)
+        annotated_candidate = annotate_github_codex_release(candidate_copy)
+        if annotated_candidate.get("origin_github_repo") and progress:
+            result = dict(annotated_candidate)
+            result["_github_progress_phase"] = "result"
+            progress(checked, checkable_total, result)
+        annotated.append(annotated_candidate)
     return annotated
 
 
@@ -1292,6 +1337,20 @@ def github_check_status_text(candidate: Dict[str, Any]) -> str:
     if error:
         return f"GitHub check failed. {github_check_fallback_text(candidate)} Reason: {error}"
     return f"GitHub check: {status}."
+
+
+def github_check_finding_text(candidate: Dict[str, Any]) -> str:
+    status = str(candidate.get("codex_release_status") or "not-detected")
+    error = compact(str(candidate.get("github_codex_check_error") or ""), 120)
+    if status == "github-native-codex-manifest":
+        return "native Codex manifest found; manual/native review needed"
+    if status == "github-origin-checked-no-native":
+        return "no native Codex manifest found; Claude-to-Codex bridge remains the path"
+    if status == "github-check-failed":
+        return f"check failed; keeping bridge/manual path" + (f" ({error})" if error else "")
+    if error:
+        return f"check unavailable; keeping bridge/manual path ({error})"
+    return f"checked; status={status}"
 
 
 def plugin_origin_metadata(item: Dict[str, Any]) -> Dict[str, Any]:
@@ -1327,14 +1386,14 @@ def plugin_origin_metadata(item: Dict[str, Any]) -> Dict[str, Any]:
     status = "not-detected"
     evidence = ""
     manifest_path = ""
-    if native_cache and native_cache.exists():
-        status = "native-codex-cache"
-        evidence = f"local Claude cache includes {native_cache}"
-        manifest_path = str(native_cache)
-    elif native_source and native_source.exists():
+    if native_source and native_source.exists():
         status = "native-codex-source"
         evidence = f"marketplace source includes {native_source}"
         manifest_path = str(native_source)
+    elif native_cache and native_cache.exists():
+        status = "native-codex-cache"
+        evidence = f"local Claude cache includes {native_cache}"
+        manifest_path = str(native_cache)
     elif github_repo:
         status = "gh-check-needed"
         evidence = f"GitHub origin detected but not checked: {github_repo}"
@@ -1363,34 +1422,70 @@ def installed_plugin_bridge_metadata(item: Dict[str, Any]) -> Dict[str, Any]:
         return {}
     cache_path = Path(install_path).expanduser() if install_path else None
     origin_source_path = Path(str(item.get("origin_source_path") or "")).expanduser() if item.get("origin_source_path") else None
-    source_path = (
-        origin_source_path
-        if origin_source_path and (origin_source_path / ".claude-plugin" / "plugin.json").exists()
-        else cache_path
-    )
-    source_kind = "source-repo" if source_path and origin_source_path and source_path == origin_source_path else "claude-cache"
-    if not source_path:
+    origin_source_url = str(item.get("origin_source_url") or item.get("origin_github_url") or "")
+    origin_github_repo = str(item.get("origin_github_repo") or "")
+    source_manifest = load_claude_plugin_manifest(origin_source_path)
+    cache_manifest = load_claude_plugin_manifest(cache_path)
+    fallback_reason = ""
+    source_path: Optional[Path]
+    source_path_text = ""
+    if source_manifest:
+        source_path = origin_source_path
+        source_kind = "marketplace-source" if item.get("origin_marketplace") else "source-repo"
+        source_path_text = str(source_path)
+    elif origin_github_repo:
+        source_path = cache_path
+        source_kind = "github-source"
+        source_path_text = origin_source_url or github_repo_url(origin_github_repo)
+        fallback_reason = (
+            "GitHub source will be materialized at install time; Claude cache is fallback if GitHub fetch fails"
+            if cache_manifest
+            else "GitHub source will be materialized at install time; no Claude cache fallback is available"
+        )
+    else:
+        source_path = cache_path
+        source_kind = "claude-cache-fallback"
+        source_path_text = str(source_path) if source_path else ""
+        if origin_source_path:
+            fallback_reason = f"formal source is missing .claude-plugin/plugin.json at {origin_source_path}"
+        elif origin_github_repo:
+            fallback_reason = "GitHub source detected but no Claude cache manifest is available for fallback metadata"
+        else:
+            fallback_reason = "formal plugin source path could not be resolved"
+    if not source_path and source_kind != "github-source":
         return {}
-    manifest = load_plugin_manifest(source_path)
-    if not source_path.is_dir() or manifest is None:
+    manifest = load_plugin_manifest(source_path) if source_path else None
+    if source_kind != "github-source" and (not source_path.is_dir() or manifest is None):
         return {}
-    agents_dir = source_path / "agents"
-    skills_dir = source_path / "skills"
+    if source_kind == "github-source" and manifest is None:
+        manifest = {}
+    source_version = plugin_manifest_version(source_manifest or manifest) if source_kind != "github-source" else ""
+    cache_version = plugin_manifest_version(cache_manifest)
+    cache_stale = bool(source_manifest and cache_manifest and source_version and cache_version and source_version != cache_version)
+    agents_dir = source_path / "agents" if source_path else Path()
+    skills_dir = source_path / "skills" if source_path else Path()
     bridge_name = f"cc-{plugin_name}"
     destination = home_dir() / ".codex" / "plugins" / bridge_name
     return {
         "bridge": True,
         "bridge_name": bridge_name,
-        "bridge_source_path": str(source_path),
-        "bridge_cache_fallback_path": str(cache_path) if cache_path and cache_path != source_path else "",
+        "bridge_source_path": source_path_text,
+        "bridge_remote_repo": origin_github_repo,
+        "bridge_remote_url": origin_source_url or github_repo_url(origin_github_repo),
+        "bridge_cache_fallback_path": str(cache_path) if cache_path and cache_manifest and (cache_path != source_path or source_kind == "github-source") else "",
         "bridge_destination_path": str(destination),
         "bridge_marketplace": marketplace_name,
         "bridge_source_plugin": plugin_name,
         "bridge_source_selector": selector,
         "bridge_source_kind": source_kind,
+        "bridge_source_preference": "authoritative-source" if source_kind != "claude-cache-fallback" else "cache-fallback",
         "bridge_source_ref": str(item.get("origin_ref") or item.get("origin_sha") or item.get("git_commit_sha") or ""),
         "bridge_source_subdir": str(item.get("origin_subdir") or ""),
         "bridge_source_repo_root": str(item.get("origin_marketplace_root") or ""),
+        "bridge_cache_fallback_reason": fallback_reason,
+        "bridge_source_version": source_version,
+        "bridge_cache_version": cache_version,
+        "bridge_cache_stale": cache_stale,
         "bridge_commit": str(item.get("git_commit_sha") or "local"),
         "bridge_version": str(item.get("version") or manifest.get("version") or ""),
         "bridge_plugin_description": str(manifest.get("description") or ""),
@@ -1620,12 +1715,25 @@ def convert_bridge_agent(md_path: Path, *, bridge_name: str, source_plugin: str,
     }
 
 
-def bridge_copy_ignore(directory: str, names: List[str]) -> set:
-    ignored = set()
-    for name in names:
-        if name in BRIDGE_COPY_IGNORE_NAMES or name.endswith(".pyc"):
-            ignored.add(name)
-    return ignored
+def safe_copy_tree(source: Path, target: Path, *, ignore_names: Optional[set] = None) -> None:
+    ignore_names = ignore_names or set()
+    if source.is_symlink():
+        raise HandoffError(f"refusing to copy symlinked source {source}")
+    if not source.is_dir():
+        raise HandoffError(f"copy source is not a directory: {source}")
+    target.mkdir(parents=True, exist_ok=False)
+    for item in source.iterdir():
+        if item.name in ignore_names or item.name.endswith(".pyc"):
+            continue
+        destination = target / item.name
+        if item.is_symlink():
+            raise HandoffError(f"refusing to copy symlinked source {item}")
+        if item.is_dir():
+            safe_copy_tree(item, destination, ignore_names=ignore_names)
+        elif item.is_file():
+            shutil.copy2(item, destination)
+        else:
+            raise HandoffError(f"refusing to copy special file {item}")
 
 
 def copy_bridge_plugin_body(source: Path, staged: Path) -> None:
@@ -1633,10 +1741,14 @@ def copy_bridge_plugin_body(source: Path, staged: Path) -> None:
         if item.name in BRIDGE_CC_ONLY_DIR_NAMES or item.name in BRIDGE_COPY_IGNORE_NAMES or item.name.endswith(".pyc"):
             continue
         target = staged / item.name
+        if item.is_symlink():
+            raise HandoffError(f"refusing to copy symlinked plugin source {item}")
         if item.is_dir():
-            shutil.copytree(item, target, ignore=bridge_copy_ignore)
-        else:
+            safe_copy_tree(item, target, ignore_names=BRIDGE_COPY_IGNORE_NAMES)
+        elif item.is_file():
             shutil.copy2(item, target)
+        else:
+            raise HandoffError(f"refusing to copy special plugin source file {item}")
 
 
 def atomic_replace_dir(target: Path, staged: Path) -> None:
@@ -1696,6 +1808,10 @@ def safe_extract_tar_bytes(payload: bytes, destination: Path) -> None:
             target = (destination / member.name).resolve()
             if not path_is_within(target, destination):
                 raise HandoffError(f"refusing to extract unsafe archive member {member.name}")
+            if member.issym() or member.islnk():
+                raise HandoffError(f"refusing to extract archive link {member.name}")
+            if not member.isdir() and not member.isreg():
+                raise HandoffError(f"refusing to extract unsupported archive member {member.name}")
         archive.extractall(destination)
 
 
@@ -1731,22 +1847,110 @@ def materialize_git_source_at_ref(repo_root: Path, ref: str, subdir: str) -> Tup
     return temp_dir, ""
 
 
+def materialize_github_source(repo: str, ref: str, subdir: str) -> Tuple[Optional[tempfile.TemporaryDirectory], str]:
+    if not repo:
+        return None, "missing GitHub repo"
+    gh_path = shutil.which("gh")
+    if not gh_path:
+        return None, "gh CLI not found"
+    api_ref = quote(ref or "HEAD", safe="")
+    try:
+        proc = subprocess.run(
+            [gh_path, "api", f"repos/{repo}/tarball/{api_ref}"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=60,
+        )
+    except Exception as exc:
+        return None, str(exc)
+    if proc.returncode != 0:
+        return None, compact(proc.stderr.decode("utf-8", errors="replace") or "gh api tarball failed", 240)
+    temp_dir = tempfile.TemporaryDirectory(prefix="ai-handoff-plugin-gh-")
+    destination = Path(temp_dir.name)
+    try:
+        safe_extract_tar_bytes(proc.stdout, destination)
+    except Exception as exc:
+        temp_dir.cleanup()
+        return None, str(exc)
+    roots = [path for path in destination.iterdir() if path.is_dir()]
+    source_root = roots[0] if len(roots) == 1 else destination
+    clean_subdir = subdir.strip("/")
+    if clean_subdir.startswith("./"):
+        clean_subdir = clean_subdir[2:]
+    source = source_root / clean_subdir if clean_subdir else source_root
+    if load_plugin_manifest(source) is None:
+        temp_dir.cleanup()
+        where = f"{repo}@{ref or 'HEAD'}"
+        if clean_subdir:
+            where += f":{clean_subdir}"
+        return None, f"{where} does not contain a Claude or Codex plugin manifest"
+    if source != destination:
+        staged = destination / "__plugin_source__"
+        source.rename(staged)
+    return temp_dir, ""
+
+
+def materialize_github_skill_source(repo: str, ref: str, subdir: str) -> Tuple[Optional[tempfile.TemporaryDirectory], str]:
+    if not repo:
+        return None, "missing GitHub repo"
+    gh_path = shutil.which("gh")
+    if not gh_path:
+        return None, "gh CLI not found"
+    api_ref = quote(ref or "HEAD", safe="")
+    try:
+        proc = subprocess.run(
+            [gh_path, "api", f"repos/{repo}/tarball/{api_ref}"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=60,
+        )
+    except Exception as exc:
+        return None, str(exc)
+    if proc.returncode != 0:
+        return None, compact(proc.stderr.decode("utf-8", errors="replace") or "gh api tarball failed", 240)
+    temp_dir = tempfile.TemporaryDirectory(prefix="ai-handoff-skill-gh-")
+    destination = Path(temp_dir.name)
+    try:
+        safe_extract_tar_bytes(proc.stdout, destination)
+    except Exception as exc:
+        temp_dir.cleanup()
+        return None, str(exc)
+    roots = [path for path in destination.iterdir() if path.is_dir()]
+    source_root = roots[0] if len(roots) == 1 else destination
+    clean_subdir = subdir.strip("/")
+    if clean_subdir.startswith("./"):
+        clean_subdir = clean_subdir[2:]
+    source = source_root / clean_subdir if clean_subdir else source_root
+    if not (source / "SKILL.md").exists():
+        temp_dir.cleanup()
+        where = f"{repo}@{ref or 'HEAD'}"
+        if clean_subdir:
+            where += f":{clean_subdir}"
+        return None, f"{where} does not contain SKILL.md"
+    if source != destination:
+        staged = destination / "__skill_source__"
+        source.rename(staged)
+    return temp_dir, ""
+
+
 def bridge_plugin_to_codex(candidate: Dict[str, Any]) -> Dict[str, Any]:
-    requested_source_path = Path(str(candidate.get("bridge_source_path") or "")).expanduser()
+    requested_source_text = str(candidate.get("bridge_source_path") or "")
+    requested_source_path = Path(requested_source_text).expanduser()
     source_path = requested_source_path
     bridge_name = str(candidate.get("bridge_name") or "")
     source_plugin = str(candidate.get("bridge_source_plugin") or candidate.get("name") or "")
     source_selector = str(candidate.get("bridge_source_selector") or candidate.get("name") or "")
     marketplace = str(candidate.get("bridge_marketplace") or "")
     commit = str(candidate.get("bridge_commit") or "local")
-    source_kind = str(candidate.get("bridge_source_kind") or "claude-cache")
+    source_kind = str(candidate.get("bridge_source_kind") or "claude-cache-fallback")
     source_ref = str(candidate.get("bridge_source_ref") or "")
     source_subdir = str(candidate.get("bridge_source_subdir") or "")
     source_repo_root = Path(str(candidate.get("bridge_source_repo_root") or "")).expanduser()
+    remote_repo = str(candidate.get("bridge_remote_repo") or "")
     cache_fallback_path = Path(str(candidate.get("bridge_cache_fallback_path") or "")).expanduser()
     source_resolution = ""
     temp_source: Optional[tempfile.TemporaryDirectory] = None
-    if source_kind == "source-repo" and source_ref and source_subdir and source_repo_root:
+    if source_kind in {"source-repo", "marketplace-source"} and source_ref and source_subdir and source_repo_root:
         temp_source, source_resolution = materialize_git_source_at_ref(source_repo_root, source_ref, source_subdir)
         if temp_source:
             source_path = Path(temp_source.name)
@@ -1755,6 +1959,15 @@ def bridge_plugin_to_codex(candidate: Dict[str, Any]) -> Dict[str, Any]:
             source_kind = "claude-cache-fallback"
         else:
             raise HandoffError(f"source repo bridge failed: {source_resolution}")
+    elif source_kind == "github-source":
+        temp_source, source_resolution = materialize_github_source(remote_repo, source_ref or "HEAD", source_subdir)
+        if temp_source:
+            source_path = Path(temp_source.name) / "__plugin_source__"
+        elif cache_fallback_path.is_dir() and load_plugin_manifest(cache_fallback_path):
+            source_path = cache_fallback_path
+            source_kind = "claude-cache-fallback"
+        else:
+            raise HandoffError(f"GitHub source bridge failed: {source_resolution}")
     if not source_path.is_dir() or not bridge_name or not source_plugin:
         raise HandoffError("missing bridge source plugin metadata")
     try:
@@ -1769,7 +1982,7 @@ def bridge_plugin_to_codex(candidate: Dict[str, Any]) -> Dict[str, Any]:
         bridge_dir = plugins_dir / bridge_name
         manifest_path = bridge_dir / ".codex-plugin" / "plugin.json"
         existing_marker = read_bridge_manifest_marker(manifest_path)
-        marker_source = str(requested_source_path)
+        marker_source = requested_source_text or str(requested_source_path)
         if manifest_path.exists() and existing_marker is None:
             raise HandoffError(f"{manifest_path} exists and is not an ai-handoff bridge")
         if (
@@ -1812,7 +2025,7 @@ def bridge_plugin_to_codex(candidate: Dict[str, Any]) -> Dict[str, Any]:
             )
             bridged_manifest[BRIDGE_MARKER_KEY]["sourceKind"] = source_kind
             resolved_source = str(source_path)
-            if source_kind == "source-repo" and source_ref:
+            if source_kind in {"source-repo", "marketplace-source"} and source_ref:
                 resolved_source = f"{marker_source}@{source_ref}"
             bridged_manifest[BRIDGE_MARKER_KEY]["resolvedSource"] = resolved_source
             bridged_manifest[BRIDGE_MARKER_KEY]["commands"] = command_skills
@@ -2016,7 +2229,8 @@ def discover_claude_sessions(
         sessions.append(
             {
                 "session_id": entry.get("sessionId"),
-                "title": entry.get("customTitle") or entry.get("summary") or entry.get("firstPrompt") or "Untitled",
+                "title": entry_session_title(entry),
+                "custom_title": entry_session_custom_title(entry),
                 "summary": entry.get("summary"),
                 "first_prompt": truncate(redact(str(entry.get("firstPrompt") or "")), 320),
                 "created": entry.get("created"),
@@ -2025,6 +2239,7 @@ def discover_claude_sessions(
                 "git_branch": entry.get("gitBranch"),
                 "project_path": entry.get("projectPath"),
                 "source_project_key": entry.get("_source_project_key"),
+                "transcript_path": str(full_path),
                 "transcript": transcript,
             }
         )
@@ -2073,15 +2288,8 @@ def read_claude_session_entries(project_dir: Path, source_key: str, project: Pat
             entry["_source_project_dir"] = str(project_dir)
             entries.append(entry)
     elif project_dir.exists():
-        for file_path in project_dir.glob("*.jsonl"):
-            entry = {
-                "sessionId": file_path.stem,
-                "fullPath": str(file_path),
-                "fileMtime": file_path.stat().st_mtime,
-                "projectPath": str(project),
-                "_source_project_key": source_key,
-                "_source_project_dir": str(project_dir),
-            }
+        for file_path in sorted(project_dir.glob("*.jsonl"), key=lambda item: item.stat().st_mtime, reverse=True):
+            entry = loose_session_entry(file_path, source_key, project)
             if not is_observer_session(entry):
                 entries.append(entry)
     indexed_ids = {str(entry.get("sessionId")) for entry in entries if entry.get("sessionId")}
@@ -2097,14 +2305,19 @@ def read_claude_session_entries(project_dir: Path, source_key: str, project: Pat
 
 def loose_session_entry(file_path: Path, source_key: str, project: Path) -> Dict[str, Any]:
     first_prompt = ""
+    fallback_prompt = ""
     summary = ""
     message_count = 0
     git_branch = None
     project_path = str(project)
+    slug = ""
+    named_title = ""
+    created_time: Optional[dt.datetime] = None
+    modified_time: Optional[dt.datetime] = None
     try:
         with file_path.open("r", encoding="utf-8", errors="replace") as handle:
             for line in handle:
-                if message_count >= 200:
+                if message_count >= 2000:
                     break
                 try:
                     obj = json.loads(line)
@@ -2113,27 +2326,52 @@ def loose_session_entry(file_path: Path, source_key: str, project: Path) -> Dict
                 if not isinstance(obj, dict):
                     continue
                 message_count += 1
+                timestamp = parse_time(obj.get("timestamp"))
+                if timestamp:
+                    created_time = created_time or timestamp
+                    if modified_time is None or timestamp > modified_time:
+                        modified_time = timestamp
                 git_branch = git_branch or obj.get("gitBranch")
                 project_path = str(obj.get("cwd") or obj.get("projectPath") or project_path)
+                if isinstance(obj.get("slug"), str) and obj.get("slug"):
+                    slug = str(obj["slug"])
                 message = obj.get("message") if isinstance(obj.get("message"), dict) else None
-                if not message or message.get("role") != "user" or first_prompt:
+                if not message or message.get("role") != "user":
+                    continue
+                if obj.get("type") and obj.get("type") != "user":
                     continue
                 content = message.get("content")
-                if isinstance(content, list) and any(isinstance(item, dict) and item.get("type") == "tool_result" for item in content):
-                    continue
                 text, _ = content_to_text(content)
-                if text and "<skill-format>true" not in text:
+                named_title = named_title or session_title_from_text(text)
+                if obj.get("isMeta"):
+                    continue
+                if content_has_tool_result(content):
+                    continue
+                if first_prompt:
+                    continue
+                if text and not is_synthetic_session_prompt(text):
                     first_prompt = truncate(text, 320)
                     summary = truncate(text, 160)
+                    continue
+                if text and not fallback_prompt:
+                    fallback_prompt = synthetic_session_prompt_label(text)
     except OSError:
         pass
-    modified = dt.datetime.fromtimestamp(file_path.stat().st_mtime, tz=dt.timezone.utc).isoformat().replace("+00:00", "Z")
+    if not first_prompt and fallback_prompt:
+        first_prompt = fallback_prompt
+        summary = fallback_prompt
+    file_modified_time = dt.datetime.fromtimestamp(file_path.stat().st_mtime, tz=dt.timezone.utc)
+    created = (created_time or file_modified_time).isoformat().replace("+00:00", "Z")
+    modified = (modified_time or file_modified_time).isoformat().replace("+00:00", "Z")
     return {
         "sessionId": file_path.stem,
         "fullPath": str(file_path),
         "firstPrompt": first_prompt,
         "summary": summary,
+        "namedTitle": named_title,
+        "slug": slug,
         "messageCount": message_count or None,
+        "created": created,
         "modified": modified,
         "fileMtime": file_path.stat().st_mtime,
         "gitBranch": git_branch,
@@ -2141,6 +2379,31 @@ def loose_session_entry(file_path: Path, source_key: str, project: Path) -> Dict
         "_source_project_key": source_key,
         "_source_project_dir": str(file_path.parent),
     }
+
+
+def is_synthetic_session_prompt(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return True
+    synthetic_markers = (
+        "<bash-input>",
+        "<bash-stdout>",
+        "<bash-stderr>",
+        "<local-command-caveat>",
+        "<local-command-stdout>",
+        "<command-name>",
+        "<command-message>",
+        "<skill-format>true",
+        "<system-reminder>",
+    )
+    return any(marker in stripped for marker in synthetic_markers)
+
+
+def synthetic_session_prompt_label(text: str) -> str:
+    command_match = re.search(r"<command-name>\s*([^<\s]+)\s*</command-name>", text)
+    if command_match:
+        return truncate(command_match.group(1), 160)
+    return ""
 
 
 def dedupe_session_entries(entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -2162,6 +2425,9 @@ def entry_matches_search(entry: Dict[str, Any], search: str) -> bool:
         for key in (
             "sessionId",
             "customTitle",
+            "title",
+            "namedTitle",
+            "slug",
             "summary",
             "firstPrompt",
             "projectPath",
@@ -2221,10 +2487,8 @@ def session_candidate(entry: Dict[str, Any]) -> Dict[str, Any]:
     full_path = str(entry.get("fullPath") or source_dir / f"{session_id}.jsonl")
     return {
         "session_id": session_id,
-        "title": truncate(
-            str(entry.get("customTitle") or entry.get("summary") or entry.get("firstPrompt") or "Untitled"),
-            160,
-        ),
+        "title": truncate(str(entry_session_title(entry)), 160),
+        "custom_title": entry_session_custom_title(entry),
         "summary": entry.get("summary"),
         "first_prompt": truncate(redact(str(entry.get("firstPrompt") or "")), 260),
         "created": entry.get("created"),
@@ -2237,10 +2501,35 @@ def session_candidate(entry: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def entry_session_custom_title(entry: Dict[str, Any]) -> str:
+    title = str(entry.get("customTitle") or entry.get("title") or entry.get("namedTitle") or "").strip()
+    if title:
+        return title
+    slug = str(entry.get("slug") or "").strip()
+    if slug:
+        return humanize_session_slug(slug)
+    return ""
+
+
+def entry_session_title(entry: Dict[str, Any]) -> str:
+    return entry_session_custom_title(entry) or str(entry.get("summary") or entry.get("firstPrompt") or "Untitled")
+
+
+def humanize_session_slug(slug: str) -> str:
+    return " ".join(part for part in slug.replace("_", "-").split("-") if part).strip()
+
+
+def session_title_from_text(text: str) -> str:
+    match = re.search(r'The user named this session "([^"]+)"', str(text or ""))
+    if not match:
+        return ""
+    return match.group(1).strip()
+
+
 def is_observer_session(entry: Dict[str, Any]) -> bool:
     text = " ".join(
         str(entry.get(key) or "")
-        for key in ("firstPrompt", "summary", "customTitle")
+        for key in ("firstPrompt", "summary", "customTitle", "title", "namedTitle", "slug")
     ).lower()
     observer_markers = (
         "claude-mem",
@@ -2360,6 +2649,91 @@ def codex_trust_for_project(project: Path, codex: Dict[str, Any]) -> Optional[st
     return None
 
 
+def frontmatter_source_value(frontmatter: Dict[str, Any], keys: Tuple[str, ...]) -> str:
+    for key in keys:
+        value = frontmatter.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def resolve_local_source_path(value: str, base: Path) -> Optional[Path]:
+    if not value:
+        return None
+    if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", value) or re.match(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", value):
+        return None
+    candidate = Path(os.path.expandvars(value)).expanduser()
+    if not candidate.is_absolute():
+        candidate = (base / candidate).resolve()
+    if candidate.is_file() and candidate.name == "SKILL.md":
+        candidate = candidate.parent
+    return candidate if (candidate / "SKILL.md").exists() else None
+
+
+def skill_source_metadata(cache_skill_dir: Path, text: str) -> Dict[str, Any]:
+    try:
+        frontmatter, _body = parse_simple_frontmatter(text)
+    except HandoffError:
+        frontmatter = {}
+    source_value = frontmatter_source_value(
+        frontmatter,
+        ("source_path", "origin_source_path", "source", "repo", "repository", "url"),
+    )
+    source_url = source_value if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", source_value) else ""
+    if not source_url and re.match(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", source_value):
+        source_url = f"https://github.com/{source_value}.git"
+    github_repo = github_repo_from_url(source_url)
+    source_path = resolve_local_source_path(source_value, cache_skill_dir)
+    if source_path and not github_repo:
+        github_repo = github_repo_from_url(git_origin_from_config(source_path))
+    if source_path:
+        return {
+            "path": str(source_path),
+            "skill_cache_path": str(cache_skill_dir),
+            "skill_source_kind": "source-repo",
+            "skill_source_preference": "authoritative-source",
+            "skill_origin_source_path": str(source_path),
+            "skill_origin_source_url": source_url,
+            "skill_origin_github_repo": github_repo,
+            "skill_origin_ref": "",
+            "skill_origin_subdir": "",
+            "skill_cache_fallback_path": str(cache_skill_dir),
+            "skill_cache_fallback_reason": "",
+        }
+    if github_repo:
+        return {
+            "path": source_url or github_repo_url(github_repo),
+            "skill_cache_path": str(cache_skill_dir),
+            "skill_source_kind": "github-source",
+            "skill_source_preference": "authoritative-source",
+            "skill_origin_source_path": "",
+            "skill_origin_source_url": source_url or github_repo_url(github_repo),
+            "skill_origin_github_repo": github_repo,
+            "skill_origin_ref": "",
+            "skill_origin_subdir": "",
+            "skill_cache_fallback_path": str(cache_skill_dir),
+            "skill_cache_fallback_reason": "GitHub source will be materialized at install time; Claude cache is fallback if GitHub fetch fails",
+        }
+    fallback_reason = ""
+    if source_value:
+        fallback_reason = f"formal skill source could not be resolved from {source_value}"
+    else:
+        fallback_reason = "no formal skill source metadata found"
+    return {
+        "path": str(cache_skill_dir),
+        "skill_cache_path": str(cache_skill_dir),
+        "skill_source_kind": "claude-cache-fallback",
+        "skill_source_preference": "cache-fallback",
+        "skill_origin_source_path": "",
+        "skill_origin_source_url": source_url,
+        "skill_origin_github_repo": github_repo,
+        "skill_origin_ref": "",
+        "skill_origin_subdir": "",
+        "skill_cache_fallback_path": str(cache_skill_dir),
+        "skill_cache_fallback_reason": fallback_reason,
+    }
+
+
 def skill_names(skill_dir: Path) -> Dict[str, Dict[str, Any]]:
     result: Dict[str, Dict[str, Any]] = {}
     if not skill_dir.exists():
@@ -2368,7 +2742,11 @@ def skill_names(skill_dir: Path) -> Dict[str, Dict[str, Any]]:
         text = read_text(skill_md, 4000) or ""
         name_match = re.search(r"(?m)^name:\s*([A-Za-z0-9_-]+)\s*$", text)
         name = name_match.group(1) if name_match else skill_md.parent.name
-        result[name] = {"name": name, "path": str(skill_md.parent), "bytes": skill_md.stat().st_size}
+        result[name] = {
+            "name": name,
+            "bytes": skill_md.stat().st_size,
+            **skill_source_metadata(skill_md.parent, text),
+        }
     return result
 
 
@@ -2403,9 +2781,9 @@ def discover_claude_config(project: Path, codex: Dict[str, Any]) -> Dict[str, An
         skill_candidates.append(
             {
                 "name": name,
-                "path": info["path"],
                 "already_in_codex": name in codex_skills,
                 "compatible_action": "already installed" if name in codex_skills else "review before copying",
+                **info,
             }
         )
     plugin_file = home / ".claude" / "plugins" / "installed_plugins.json"
@@ -2534,16 +2912,39 @@ def candidate_scope_and_risk(action_type: str, item: Dict[str, Any], project: Pa
             manual_steps.append(f"run codex mcp login {item.get('name')}")
     elif action_type == "skill":
         skill_path = Path(str(item.get("path") or "")).expanduser()
-        skill_text = read_text(skill_path / "SKILL.md", 12000) or ""
+        source_kind = str(item.get("skill_source_kind") or "claude-cache-fallback")
+        cache_skill_path = Path(str(item.get("skill_cache_fallback_path") or item.get("skill_cache_path") or "")).expanduser()
+        text_path = skill_path if source_kind != "github-source" else cache_skill_path
+        skill_text = read_text(text_path / "SKILL.md", 12000) or ""
         has_local_path = "/Users/" in skill_text or str(home_dir()) in skill_text
-        portable = (skill_path / "SKILL.md").exists() and not has_local_path
-        source_scope = "project" if source and path_is_within(skill_path, project) else "global"
-        why_relevant = "Claude skill folder with SKILL.md." if portable else "Claude skill folder needs manual review."
-        evidence = f"from {skill_path}"
+        portable = ((skill_path / "SKILL.md").exists() or source_kind == "github-source") and not has_local_path
+        source_scope = "project" if source_kind != "github-source" and source and path_is_within(skill_path, project) else "global"
+        if source_kind == "source-repo":
+            why_relevant = "Claude skill source metadata resolves to a formal source folder with SKILL.md."
+            evidence = f"skill source repo: {skill_path}"
+        elif source_kind == "github-source":
+            why_relevant = "Claude skill source metadata resolves to a GitHub source that can be materialized for Codex."
+            evidence = f"GitHub skill source: {item.get('skill_origin_source_url') or item.get('path')}"
+            requires_network = True
+            risk_badges.extend(["network", "github-origin"])
+        else:
+            why_relevant = "Claude skill cache fallback with SKILL.md." if portable else "Claude skill cache fallback needs manual review."
+            fallback_reason = str(item.get("skill_cache_fallback_reason") or "")
+            evidence = f"Claude skill cache fallback: {skill_path}"
+            if fallback_reason:
+                evidence = f"{evidence} ({fallback_reason})"
         relevance_score = "high" if source_scope == "project" else "low"
         risk = "medium"
         if has_local_path:
             risk_badges.append("local-path")
+        if source_kind == "source-repo":
+            risk_badges.append("source-repo")
+            if item.get("skill_origin_github_repo"):
+                risk_badges.append("git-source")
+        elif source_kind == "github-source":
+            risk_badges.extend(["source-repo", "git-source"])
+        else:
+            risk_badges.append("cache-fallback")
         manual_steps.append("review copied skill instructions before relying on them")
     elif action_type == "plugin":
         origin = plugin_origin_metadata(item)
@@ -2561,14 +2962,41 @@ def candidate_scope_and_risk(action_type: str, item: Dict[str, Any], project: Pa
             why_relevant = (
                 "Claude plugin can be bridged into a Codex plugin with command, skill, and agent conversion."
             )
-            if bridge.get("bridge_source_kind") == "source-repo":
+            source_kind = str(bridge.get("bridge_source_kind") or "")
+            if source_kind == "marketplace-source":
+                evidence = f"marketplace source plugin: {bridge['bridge_source_path']}"
+            elif source_kind == "source-repo":
                 evidence = f"source repo plugin: {bridge['bridge_source_path']}"
+            elif source_kind == "github-source":
+                evidence = f"GitHub source plugin: {bridge.get('bridge_remote_url') or bridge.get('bridge_remote_repo')}"
+                if bridge.get("bridge_cache_fallback_reason"):
+                    evidence = f"{evidence} ({bridge['bridge_cache_fallback_reason']})"
             else:
                 evidence = f"Claude installed cache fallback: {bridge['bridge_source_path']}"
+                if bridge.get("bridge_cache_fallback_reason"):
+                    evidence = f"{evidence} ({bridge['bridge_cache_fallback_reason']})"
+            if bridge.get("bridge_cache_stale"):
+                evidence = (
+                    f"{evidence}; cache version {bridge.get('bridge_cache_version') or 'unknown'} "
+                    f"differs from source version {bridge.get('bridge_source_version') or 'unknown'}"
+                )
             relevance_score = "medium"
             risk_badges.extend(["local-path", "bridge"])
+            if origin.get("origin_marketplace"):
+                risk_badges.append("marketplace")
+            if source_kind in {"marketplace-source", "source-repo"} and (
+                origin.get("origin_github_repo") or bridge.get("bridge_source_ref")
+            ):
+                risk_badges.append("git-source")
+            if source_kind == "github-source":
+                requires_network = True
+                risk_badges.extend(["network", "github-origin", "git-source"])
             if str(origin.get("codex_release_status") or "").startswith("native-codex"):
                 risk_badges.append("codex-native")
+                blocked_reason = (
+                    "native Codex plugin metadata was found; review/install the native Codex package instead of "
+                    "auto-bridging this Claude plugin"
+                )
                 manual_steps.append("native Codex plugin metadata was found locally; prefer that package if it is complete")
             elif origin.get("origin_github_repo"):
                 manual_steps.append("optional: run ai-handoff globals PATH --check-github to verify native Codex packaging with gh")
@@ -2788,7 +3216,7 @@ def privacy_metadata(manifest: Dict[str, Any]) -> Dict[str, Any]:
     ]
     if selected_count:
         written_context.append("Claude session titles and summaries")
-        written_context.append("Recent prompts, assistant notes, commands, and local transcript paths in manifest JSON")
+        written_context.append("Recent prompts, assistant notes, commands, and local transcript paths in AGENTS.md and manifest JSON")
     if contains_local_inventory:
         written_context.append("Claude/Codex MCP, skill, plugin, and nearby project inventory with local paths")
     if setup_capture_count:
@@ -2871,30 +3299,85 @@ def build_diagnostics(manifest: Dict[str, Any]) -> List[Dict[str, Any]]:
     return diagnostics
 
 
-def session_bullets(manifest: Dict[str, Any], limit: Optional[int] = 5, include_private: bool = False) -> List[str]:
+def session_bullets(
+    manifest: Dict[str, Any],
+    limit: Optional[int] = 5,
+    include_private: bool = False,
+    visual: bool = False,
+) -> List[str]:
     sessions = manifest["claude"]["sessions"].get("selected", [])
     bullets = []
     shown_sessions = sessions if limit is None else sessions[:limit]
-    for session in shown_sessions:
-        title = truncate(str(session.get("title") or "Untitled"), 120)
+    for index, session in enumerate(shown_sessions, start=1):
+        custom_title = compact(str(session.get("custom_title") or ""), 160)
+        description = compact(
+            str(session.get("summary") or session.get("first_prompt") or session.get("title") or "No description available"),
+            260,
+        )
         modified = session.get("modified") or session.get("created") or "unknown time"
-        bullets.append(f"- {title} ({modified})")
-        summary = session.get("summary")
-        if summary:
-            bullets.append(f"  Summary: {truncate(str(summary), 220)}")
+        if bullets:
+            bullets.append(muted_text("-" * 54) if visual else "")
+        if custom_title:
+            title = f"Conversation {index}: {custom_title}"
+        else:
+            title = f"Conversation {index}"
+        bullets.append(color_text(title, ANSI_BOLD) if visual else title)
+        bullets.append(f"  {label_text('Time:') if visual else 'Time:'} {modified}")
+        if description and description != custom_title:
+            bullets.append(f"  {label_text('Description:') if visual else 'Description:'} {description}")
         if not include_private:
             continue
         prompt = session.get("first_prompt") or ""
         if prompt:
-            bullets.append(f"  First prompt: {truncate(prompt, 220)}")
+            bullets.append(f"  {label_text('First prompt:') if visual else 'First prompt:'} {compact(str(prompt), 220)}")
         transcript = session.get("transcript") or {}
         prompts = transcript.get("user_prompts") or []
         if prompts:
-            bullets.append(f"  Recent prompt: {truncate(str(prompts[-1]), 220)}")
+            bullets.append(f"  {label_text('Recent prompt:') if visual else 'Recent prompt:'} {compact(str(prompts[-1]), 220)}")
+        notes = transcript.get("assistant_notes") or []
+        if notes:
+            bullets.append(f"  {label_text('Recent assistant note:') if visual else 'Recent assistant note:'} {compact(str(notes[-1]), 220)}")
         commands = transcript.get("commands") or []
+        commands = [command for command in commands if is_handoff_relevant_command(str(command))]
         if commands:
-            bullets.append(f"  Commands seen: {truncate('; '.join(commands[:3]), 260)}")
+            bullets.append(f"  {label_text('Commands seen:') if visual else 'Commands seen:'} {compact('; '.join(commands[:3]), 260)}")
     return bullets
+
+
+def selected_transcript_file_lines(manifest: Dict[str, Any]) -> List[str]:
+    sessions = manifest["claude"]["sessions"].get("selected", [])
+    lines = [
+        "- For deeper context, read the selected Claude transcript JSONL files directly. They are local Claude Code artifacts and may disappear if Claude cleanup removes old transcripts.",
+    ]
+    transcript_rows = []
+    for index, session in enumerate(sessions, start=1):
+        path = str(session.get("transcript_path") or "").strip()
+        if not path:
+            continue
+        title = compact(str(session.get("custom_title") or session.get("title") or session.get("summary") or f"Conversation {index}"), 120)
+        session_id = str(session.get("session_id") or f"conversation-{index}")
+        transcript_rows.append(f"  - Conversation {index}: {title} ({session_id}) -> {path}")
+    if not transcript_rows:
+        lines.append("  - No transcript file paths were captured for the selected conversations; use .codex/handoff/manifest.json for available summaries.")
+        return lines
+    lines.extend(transcript_rows)
+    return lines
+
+
+def is_handoff_relevant_command(command: str) -> bool:
+    lowered = command.lower()
+    noisy_fragments = (
+        "claude_plugin_root",
+        "claude_config_dir",
+        "plugin_root",
+        "plugins/cache",
+        "export path=",
+        "telemetry-session-start",
+        "ensure-telemetry",
+        "loading coaching frame",
+        "loading work context",
+    )
+    return not any(fragment in lowered for fragment in noisy_fragments)
 
 
 def global_action_display_name(action: Dict[str, Any]) -> str:
@@ -2934,28 +3417,58 @@ def codex_tooling_status_lines(manifest: Dict[str, Any]) -> List[str]:
         for result in skipped_results:
             reason = str(result.get("reason") or "manual follow-up required")
             lines.append(f"  - {result.get('id')}: {reason}")
+    native_actions = native_codex_followup_actions(manifest)
+    if native_actions:
+        lines.append("- Native Codex plugin install follow-up:")
+        for action in native_actions[:8]:
+            source = str(action.get("origin_github_repo") or action.get("origin_source_url") or action.get("origin_source_path") or "")
+            suffix = f" ({source})" if source else ""
+            lines.append(
+                f"  - {action.get('id')}: native Codex metadata was detected; install or enable the native Codex package instead of auto-bridging the Claude plugin{suffix}."
+            )
+        if len(native_actions) > 8:
+            lines.append(f"  - +{len(native_actions) - 8} more native Codex follow-up item(s); see .codex/handoff/manifest.json.")
     lines.append("- Full install details are in .codex/handoff/manifest.json.")
     return lines
+
+
+def native_codex_followup_actions(manifest: Dict[str, Any]) -> List[Dict[str, Any]]:
+    selected = [item for item in manifest.get("selected_global_actions") or [] if isinstance(item, dict)]
+    all_candidates = [item for item in manifest.get("global_candidates") or [] if isinstance(item, dict)]
+    actions_by_id: Dict[str, Dict[str, Any]] = {}
+    for item in all_candidates + selected:
+        if (
+            item.get("type") == "plugin"
+            and str(item.get("codex_release_status") or "").startswith(("native-codex", "github-native-codex"))
+        ):
+            actions_by_id[str(item.get("id") or action_hash(item))] = item
+    return sorted(actions_by_id.values(), key=lambda item: str(item.get("id") or ""))
 
 
 def claude_md_source_lines(manifest: Dict[str, Any]) -> List[str]:
     project = manifest["project"]
     source = project.get("claude_md_source") or {}
     text = str(source.get("text") or "")
-    if not text:
-        return []
-    fence = markdown_fence(text)
     lines = [
         "## First-Run Codex Distillation",
-        "This AGENTS.md section was generated by ai-handoff. First ask Codex to:",
-        "1. Read the selected Claude conversations, Claude setup capture, and the CLAUDE.md source snapshot below.",
+        "This generated block is handoff input, not the final durable project memory.",
+        "On the first Codex run after this handoff, ask Codex to:",
+        "1. Read the selected Claude conversations, Claude setup capture, tooling status, and any CLAUDE.md source snapshot below.",
         "2. Edit AGENTS.md outside the ai-handoff managed markers with durable project context: rules, workflows, commands, constraints, and anything Codex should keep using.",
-        "3. Convert CLAUDE.md-specific wording into Codex-appropriate instructions and merge any rules found in CLAUDE.md or Claude permission settings.",
+        "3. Convert Claude-specific wording into Codex-appropriate instructions and merge any rules found in CLAUDE.md, Claude settings, or selected conversations.",
         "4. Drop stale, duplicated, or one-off handoff details so future sessions do not accumulate ghost rules.",
         "",
-        "## CLAUDE.md Source Snapshot",
-        "- Best-effort secret redaction was applied before embedding this snapshot.",
     ]
+    if not text:
+        lines.append("- No CLAUDE.md source snapshot was available for this run.")
+        return lines
+    fence = markdown_fence(text)
+    lines.extend(
+        [
+            "## CLAUDE.md Source Snapshot",
+            "- Best-effort secret redaction was applied before embedding this snapshot.",
+        ]
+    )
     if source.get("truncated"):
         lines.append(f"- Snapshot truncated at {source.get('limit') or CLAUDE_MD_SOURCE_LIMIT} characters; inspect CLAUDE.md for the complete source.")
     lines.extend(
@@ -2982,10 +3495,10 @@ def render_summary(manifest: Dict[str, Any]) -> str:
         f"Project: {manifest['target_path']}",
         f"Suggested Codex goal: {manifest['suggested_goal']}",
         "",
-        "## Project Readiness",
-        f"- CLAUDE.md: {'found' if project['has_claude_md'] else 'missing'}",
-        f"- AGENTS.md: {'found' if project['has_agents_md'] else 'missing'}",
-        f"- Codex trust level: {codex.get('trust_level') or 'not configured'}",
+        "## Project Snapshot",
+        f"- CLAUDE.md source: {'found and used' if project['has_claude_md'] else 'not present for this project'}",
+        f"- Existing AGENTS.md before handoff: {'found; managed section will be updated' if project['has_agents_md'] else 'not present; handoff will create it'}",
+        f"- Codex trust: {codex.get('trust_level') or 'no explicit trust entry detected'}",
         f"- Git branch: {project['git'].get('branch') or 'unknown'}",
         "",
         "## Recent Claude Context",
@@ -3046,30 +3559,38 @@ def render_agents_managed_section(manifest: Dict[str, Any]) -> str:
         "# Codex Handoff Context",
         "",
         "This AGENTS.md section was generated by ai-handoff. Keep durable project rules outside the managed markers.",
-        "Codex loads AGENTS.md automatically when it works in this project; use this generated section as handoff context before starting work.",
+        "Codex loads AGENTS.md automatically when it works in this project; use this block as temporary handoff context, then distill durable rules outside the block.",
         "",
         f"Generated: {manifest['generated_at']}",
         f"Flow: {flow.get('label') or 'Claude Code -> Codex'}",
         f"Source project: {manifest['target_path']}",
         f"Suggested goal: {manifest['suggested_goal']}",
         "",
-        "## Project Guidance",
     ]
+    lines.extend(claude_md_source_lines(manifest))
+    lines.extend(
+        [
+            "",
+            "## Project Guidance",
+        ]
+    )
     if project["has_claude_md"]:
         lines.append("- CLAUDE.md was found and used as source guidance.")
         headings = next((item.get("headings") for item in project["guidance_files"] if item.get("path") == "CLAUDE.md"), [])
         if headings:
             lines.append("- CLAUDE.md headings: " + "; ".join(headings[:10]))
     else:
-        lines.append("- CLAUDE.md was not found.")
+        lines.append("- No CLAUDE.md was found; use selected conversations, captured Claude setup, and repo files as handoff inputs.")
     lines.extend(["", "## Recent Claude Work"])
     lines.append(f"- Selected sessions: {manifest['claude']['sessions'].get('selected_count', 0)} of {manifest['claude']['sessions'].get('found_count', 0)} discovered.")
     bullets = session_bullets(
         manifest,
         limit=None,
-        include_private=bool(manifest["selection"].get("include_transcript_excerpts")),
+        include_private=True,
     )
     lines.extend(bullets if bullets else ["- No recent Claude sessions selected."])
+    lines.extend(["", "## Selected Claude Transcript Files"])
+    lines.extend(selected_transcript_file_lines(manifest))
     usage_summary = manifest["claude"]["sessions"].get("usage_summary") or {}
     if any(usage_kind_count(usage_summary, kind) for kind in ("mcp_servers", "skills", "plugins")):
         lines.extend(
@@ -3083,10 +3604,6 @@ def render_agents_managed_section(manifest: Dict[str, Any]) -> str:
         )
     lines.extend(["", "## Claude Setup Captured"])
     lines.extend(claude_setup_capture_lines(manifest))
-    source_lines = claude_md_source_lines(manifest)
-    if source_lines:
-        lines.extend([""])
-        lines.extend(source_lines)
     lines.extend(["", "## Codex Tooling Prepared"])
     lines.extend(codex_tooling_status_lines(manifest))
     lines.extend(["", "## Commands Detected"])
@@ -3252,6 +3769,8 @@ def print_dry_run(manifest: Dict[str, Any]) -> None:
     print("Claude context:")
     print(f"  [info] sessions found: {sessions.get('found_count', 0)}")
     print(f"  [info] sessions selected: {sessions.get('selected_count', 0)}")
+    if not sessions.get("found_count"):
+        print(f"  [info] {conversation_retention_caption()}")
     source_keys = sessions.get("source_project_keys") or []
     if source_keys:
         print(f"  [info] Claude project keys: {', '.join(source_keys[:3])}" + (" ..." if len(source_keys) > 3 else ""))
@@ -3314,9 +3833,9 @@ INTERACTIVE_OPTIONS = [
     ("global_imports", "Codex-wide installs"),
     ("include_transcript_excerpts", "Include fuller transcript excerpts on next scan"),
 ]
-ANSI_CLEAR_VIEWPORT = "\033[2J\033[H"
 ANSI_HIDE_CURSOR = "\033[?25l"
 ANSI_SHOW_CURSOR = "\033[?25h"
+ANSI_CLEAR_VIEWPORT = ANSI_HIDE_CURSOR + "\033[H\033[J"
 ANSI_RESET = "\033[0m"
 ANSI_BOLD = "\033[1m"
 ANSI_DIM = "\033[2m"
@@ -3335,7 +3854,12 @@ def supports_static_menu() -> bool:
 
 
 def supports_color() -> bool:
+    forced = os.environ.get("AI_HANDOFF_COLOR", "").strip().lower()
     term = os.environ.get("TERM", "")
+    if forced in {"1", "true", "yes", "always", "force"}:
+        return bool(sys.stdout.isatty() and term and term != "dumb")
+    if forced in {"0", "false", "no", "never"}:
+        return False
     return bool(sys.stdout.isatty() and term and term != "dumb" and "NO_COLOR" not in os.environ)
 
 
@@ -3347,6 +3871,18 @@ def color_text(text: str, code: str) -> str:
 
 def step_heading(step: str, title: str) -> str:
     return f"{color_text(step, ANSI_BOLD)}: {color_text(title, ANSI_CYAN)}"
+
+
+def label_text(text: str) -> str:
+    return color_text(text, ANSI_CYAN)
+
+
+def muted_text(text: str) -> str:
+    return color_text(text, ANSI_DIM)
+
+
+def selected_mark(mark: str) -> str:
+    return color_text(f"[{mark}]", ANSI_GREEN if mark == "x" else ANSI_DIM)
 
 
 def render_interactive_menu(manifest: Dict[str, Any], cursor: int = 0) -> str:
@@ -3566,22 +4102,28 @@ def current_session_page_candidates(
 
 
 def render_session_details(candidate: Dict[str, Any]) -> str:
+    custom_title = compact(str(candidate.get("custom_title") or ""), 160)
+    description = compact(
+        str(candidate.get("summary") or candidate.get("first_prompt") or candidate.get("title") or ""),
+        320,
+    )
     lines = [
-        "Claude Conversation Details",
+        color_text("Claude Conversation Details", ANSI_BOLD),
         "",
-        f"ID: {candidate.get('session_id')}",
-        f"Title: {candidate.get('title') or 'Untitled'}",
-        f"Modified: {candidate.get('modified') or candidate.get('created') or 'unknown time'}",
-        f"Messages: {candidate.get('message_count', 'unknown')}",
-        f"Branch: {candidate.get('git_branch') or 'unknown'}",
-        f"Source project: {candidate.get('source_project_key') or 'current project'}",
+        f"{label_text('ID:')} {candidate.get('session_id')}",
+        f"{label_text('Title:')} {custom_title or 'No Claude title recorded'}",
+        f"{label_text('Description:')} {description or 'No description available'}",
+        f"{label_text('Modified:')} {candidate.get('modified') or candidate.get('created') or 'unknown time'}",
+        f"{label_text('Messages:')} {candidate.get('message_count', 'unknown')}",
+        f"{label_text('Branch:')} {candidate.get('git_branch') or 'unknown'}",
+        f"{label_text('Source project:')} {candidate.get('source_project_key') or 'current project'}",
     ]
     if candidate.get("transcript_path"):
-        lines.append(f"Transcript: {candidate['transcript_path']}")
+        lines.append(f"{label_text('Transcript:')} {candidate['transcript_path']}")
     if candidate.get("first_prompt"):
-        lines.extend(["", "First prompt:", str(candidate["first_prompt"])])
+        lines.extend(["", label_text("First prompt:"), str(candidate["first_prompt"])])
     if candidate.get("summary"):
-        lines.extend(["", "Summary:", str(candidate["summary"])])
+        lines.extend(["", label_text("Summary:"), str(candidate["summary"])])
     return "\n".join(lines)
 
 
@@ -3591,22 +4133,24 @@ def render_session_picker(
     selected_ids: Optional[List[str]] = None,
     filter_text: str = "",
     page_size: int = GLOBAL_PICKER_PAGE_SIZE,
+    expanded_ids: Optional[set] = None,
 ) -> str:
     sessions = manifest["claude"]["sessions"]
     all_candidates = sessions.get("candidates") or []
     candidates = visible_session_candidates(manifest, filter_text=filter_text)
     selected_id_set = set(selected_ids if selected_ids is not None else sessions.get("selected_session_ids") or [])
+    expanded_id_set = set(expanded_ids or set())
     start, end = global_picker_page_window(cursor, len(candidates), page_size=page_size)
     page = candidates[start:end]
     page_count = max(1, (len(candidates) + page_size - 1) // page_size)
     current_page = 1 if not candidates else (start // page_size) + 1
     lines = [
         "",
-        "Choose Claude Conversations",
-        f"Project: {manifest['target_path']}",
-        f"Selection: {sessions.get('selection_strategy')}",
+        color_text("Choose Claude Conversations", ANSI_BOLD),
+        f"{label_text('Project:')} {manifest['target_path']}",
+        f"{label_text('Selection:')} {sessions.get('selection_strategy')}",
         (
-            f"Filter: {filter_text or 'none'} | "
+            f"{label_text('Filter:')} {filter_text or 'none'} | "
             f"Showing: {start + 1 if candidates else 0}-{end} of {len(candidates)} | "
             f"Page: {current_page}/{page_count} | Selected: {len(selected_id_set)} | "
             f"Found: {len(all_candidates)}"
@@ -3619,6 +4163,7 @@ def render_session_picker(
             lines.append("Clear the filter with / then Enter.")
         else:
             lines.append("No Claude conversations found for this project.")
+            lines.append(conversation_retention_caption())
             lines.append(
                 f"Try: ai-handoff conversations {shlex.quote(manifest['target_path'])} "
                 "--all-projects --search TEXT"
@@ -3629,21 +4174,67 @@ def render_session_picker(
         mark = "x" if session_id in selected_id_set else " "
         pointer = ">" if absolute_index == cursor else " "
         modified = candidate.get("modified") or candidate.get("created") or "unknown time"
-        title = truncate(str(candidate.get("title") or "Untitled"), 90)
+        custom_title = compact(str(candidate.get("custom_title") or ""), 90)
+        title = custom_title or f"Conversation {absolute_index + 1}"
+        description = compact(
+            str(candidate.get("summary") or candidate.get("first_prompt") or candidate.get("title") or ""),
+            120,
+        )
         source = candidate.get("source_project_key")
-        source_text = f" | {source}" if source else ""
-        lines.append(f"{pointer} {offset}. [{mark}] {title} ({modified}{source_text})")
-        prompt = candidate.get("first_prompt")
-        if prompt:
-            lines.append(f"     {truncate(str(prompt), 120)}")
+        metadata = [str(modified)]
+        if candidate.get("git_branch"):
+            metadata.append(f"branch {candidate['git_branch']}")
+        if candidate.get("message_count"):
+            metadata.append(f"{candidate['message_count']} messages")
+        if source:
+            metadata.append(str(source))
+        pointer_text = color_text(pointer, ANSI_CYAN) if pointer == ">" else pointer
+        lines.append(f"{pointer_text} {offset}. {selected_mark(mark)} {color_text(title, ANSI_BOLD) if custom_title else title}")
+        lines.append(f"     {muted_text(' | '.join(metadata))}")
+        if description and description != custom_title:
+            lines.append(f"     {label_text('Description:')} {description}")
+        if session_id in expanded_id_set:
+            lines.extend(expanded_session_context_lines(candidate))
     lines.extend(
         [
             "",
-            "Commands: Up/k Down/j, f/b page, Space/x toggle, number toggles, / filter, d details, Enter done, q cancel",
-            f"Recovery: ai-handoff conversations {shlex.quote(manifest['target_path'])} --all-projects --search TEXT",
+            (
+                muted_text("Commands: Up/k Down/j move | f/b page | Space/x select | 1-9 toggle | ")
+                + muted_text(f"/ filter | e expand | d details | Enter hand off {len(selected_id_set)} selected | q cancel")
+            ),
+            muted_text(f"Recovery: ai-handoff conversations {shlex.quote(manifest['target_path'])} --all-projects --search TEXT"),
         ]
     )
     return "\n".join(lines)
+
+
+def expanded_session_context_lines(candidate: Dict[str, Any]) -> List[str]:
+    lines = [f"     {label_text('Context:')}"]
+    if candidate.get("custom_title"):
+        lines.append(f"       {label_text('Title:')} {candidate['custom_title']}")
+    lines.append(f"       {label_text('Session ID:')} {candidate.get('session_id')}")
+    if candidate.get("project_path"):
+        lines.append(f"       {label_text('Project:')} {candidate['project_path']}")
+    transcript_path = candidate.get("transcript_path")
+    if transcript_path:
+        transcript = summarize_transcript(Path(str(transcript_path)), include_excerpts=False)
+        prompts = [compact(str(prompt), 220) for prompt in transcript.get("user_prompts") or [] if prompt]
+        notes = [compact(str(note), 220) for note in transcript.get("assistant_notes") or [] if note]
+        if prompts:
+            lines.append(f"       {label_text('Recent request:')} {prompts[-1]}")
+        if notes:
+            lines.append(f"       {label_text('Recent assistant note:')} {notes[-1]}")
+    first_prompt = compact(str(candidate.get("first_prompt") or ""), 220)
+    if first_prompt and not any(first_prompt in line for line in lines):
+        lines.append(f"       {label_text('First prompt:')} {first_prompt}")
+    return lines
+
+
+def conversation_retention_caption() -> str:
+    return (
+        "Note: Claude Code local transcripts may be cleaned up after 30 days by default; "
+        "increase cleanupPeriodDays in Claude Code settings if you want longer local handoff history."
+    )
 
 
 def update_session_selection(manifest: Dict[str, Any], selected_ids: List[str]) -> None:
@@ -3663,6 +4254,7 @@ def update_session_selection(manifest: Dict[str, Any], selected_ids: List[str]) 
             {
                 "session_id": candidate.get("session_id"),
                 "title": candidate.get("title"),
+                "custom_title": candidate.get("custom_title"),
                 "summary": candidate.get("summary"),
                 "first_prompt": candidate.get("first_prompt"),
                 "created": candidate.get("created"),
@@ -3692,6 +4284,7 @@ def session_picker(manifest: Dict[str, Any]) -> None:
         show_message_screen("No Claude conversations found for this project.")
         return
     selected_ids = list(sessions.get("selected_session_ids") or [])
+    expanded_ids: set = set()
     cursor = 0
     filter_text = ""
     while True:
@@ -3708,6 +4301,7 @@ def session_picker(manifest: Dict[str, Any]) -> None:
                 selected_ids=selected_ids,
                 filter_text=filter_text,
                 page_size=page_size,
+                expanded_ids=expanded_ids,
             ),
             flush=True,
         )
@@ -3726,6 +4320,14 @@ def session_picker(manifest: Dict[str, Any]) -> None:
         if action == "details":
             if candidates:
                 show_message_screen(render_session_details(candidates[cursor]))
+            continue
+        if action == "expand":
+            if candidates:
+                session_id = str(candidates[cursor].get("session_id") or "")
+                if session_id in expanded_ids:
+                    expanded_ids.remove(session_id)
+                elif session_id:
+                    expanded_ids.add(session_id)
             continue
         if action == "toggle":
             if not candidates:
@@ -3773,7 +4375,7 @@ def apply_picker_key(
         return "continue", min(count - 1, cursor + page_size)
     if key == "toggle":
         return "toggle", cursor
-    if key in {"filter", "details"}:
+    if key in {"filter", "details", "expand"}:
         return key, cursor
     if key.startswith("toggle:"):
         return key, cursor
@@ -3908,6 +4510,16 @@ def global_action_candidates(manifest: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "label": f"Copy Claude skill {name} -> ~/.codex/skills/{name}",
                 "name": name,
                 "source_path": item.get("path"),
+                "skill_source_kind": item.get("skill_source_kind"),
+                "skill_source_preference": item.get("skill_source_preference"),
+                "skill_origin_source_path": item.get("skill_origin_source_path", ""),
+                "skill_origin_source_url": item.get("skill_origin_source_url", ""),
+                "skill_origin_github_repo": item.get("skill_origin_github_repo", ""),
+                "skill_origin_ref": item.get("skill_origin_ref", ""),
+                "skill_origin_subdir": item.get("skill_origin_subdir", ""),
+                "skill_cache_path": item.get("skill_cache_path", ""),
+                "skill_cache_fallback_path": item.get("skill_cache_fallback_path", ""),
+                "skill_cache_fallback_reason": item.get("skill_cache_fallback_reason", ""),
                 "destination_path": str(home_dir() / ".codex" / "skills" / name),
                 "hash": action_hash({"type": "skill", "name": name, "source_path": item.get("path")}),
                 "confidence": "medium",
@@ -3957,15 +4569,22 @@ def global_action_candidates(manifest: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "bridge": bool(item.get("bridge")),
                 "bridge_name": item.get("bridge_name"),
                 "bridge_source_path": item.get("bridge_source_path"),
+                "bridge_remote_repo": item.get("bridge_remote_repo"),
+                "bridge_remote_url": item.get("bridge_remote_url"),
                 "bridge_cache_fallback_path": item.get("bridge_cache_fallback_path"),
                 "bridge_destination_path": item.get("bridge_destination_path"),
                 "bridge_marketplace": item.get("bridge_marketplace"),
                 "bridge_source_plugin": item.get("bridge_source_plugin"),
                 "bridge_source_selector": item.get("bridge_source_selector"),
                 "bridge_source_kind": item.get("bridge_source_kind"),
+                "bridge_source_preference": item.get("bridge_source_preference"),
                 "bridge_source_ref": item.get("bridge_source_ref"),
                 "bridge_source_subdir": item.get("bridge_source_subdir"),
                 "bridge_source_repo_root": item.get("bridge_source_repo_root"),
+                "bridge_cache_fallback_reason": item.get("bridge_cache_fallback_reason"),
+                "bridge_source_version": item.get("bridge_source_version"),
+                "bridge_cache_version": item.get("bridge_cache_version"),
+                "bridge_cache_stale": bool(item.get("bridge_cache_stale")),
                 "bridge_commit": item.get("bridge_commit"),
                 "bridge_version": item.get("bridge_version"),
                 "bridge_skill_count": item.get("bridge_skill_count", 0),
@@ -4234,14 +4853,36 @@ def render_global_candidate_details(candidate: Dict[str, Any]) -> str:
         lines.append(f"Source path: {candidate['source_path']}")
     if candidate.get("destination_path"):
         lines.append(f"Destination: {candidate['destination_path']}")
+    if candidate.get("type") == "skill":
+        lines.append(f"Skill source kind: {candidate.get('skill_source_kind') or 'unknown'}")
+        if candidate.get("skill_origin_source_path"):
+            lines.append(f"Skill origin path: {candidate.get('skill_origin_source_path')}")
+        if candidate.get("skill_origin_source_url"):
+            lines.append(f"Skill origin URL: {candidate.get('skill_origin_source_url')}")
+        if candidate.get("skill_cache_fallback_path"):
+            lines.append(f"Skill cache fallback: {candidate.get('skill_cache_fallback_path')}")
+        if candidate.get("skill_cache_fallback_reason"):
+            lines.append(f"Skill fallback reason: {candidate.get('skill_cache_fallback_reason')}")
     if candidate.get("bridge"):
         lines.append(f"Bridge name: {candidate.get('bridge_name')}")
         lines.append(f"Bridge source kind: {candidate.get('bridge_source_kind') or 'unknown'}")
         lines.append(f"Bridge source: {candidate.get('bridge_source_path')}")
+        if candidate.get("bridge_remote_repo"):
+            lines.append(f"Bridge remote repo: {candidate.get('bridge_remote_repo')}")
+        if candidate.get("bridge_remote_url"):
+            lines.append(f"Bridge remote URL: {candidate.get('bridge_remote_url')}")
+        if candidate.get("bridge_source_version"):
+            lines.append(f"Bridge source version: {candidate.get('bridge_source_version')}")
+        if candidate.get("bridge_cache_version"):
+            lines.append(f"Bridge cache version: {candidate.get('bridge_cache_version')}")
+        if candidate.get("bridge_cache_stale"):
+            lines.append("Bridge cache status: stale compared with resolved source")
         if candidate.get("bridge_source_ref"):
             lines.append(f"Bridge ref: {candidate.get('bridge_source_ref')}")
         if candidate.get("bridge_cache_fallback_path"):
             lines.append(f"Cache fallback: {candidate.get('bridge_cache_fallback_path')}")
+        if candidate.get("bridge_cache_fallback_reason"):
+            lines.append(f"Cache fallback reason: {candidate.get('bridge_cache_fallback_reason')}")
         lines.append(f"Bridge destination: {candidate.get('bridge_destination_path')}")
         lines.append(f"Bridge skills: {candidate.get('bridge_skill_count', 0)}")
         lines.append(f"Bridge agents: {candidate.get('bridge_agent_count', 0)}")
@@ -4279,6 +4920,29 @@ def render_global_candidate_details(candidate: Dict[str, Any]) -> str:
         lines.append("Manual steps:")
         lines.extend(f"- {step}" for step in manual_steps)
     return "\n".join(lines)
+
+
+def github_check_failure_warning(candidates: List[Dict[str, Any]]) -> str:
+    failures = [
+        candidate
+        for candidate in candidates
+        if candidate.get("github_codex_check_error")
+        and candidate.get("codex_release_status") != "github-origin-checked-no-native"
+    ]
+    if not failures:
+        return ""
+    reason_counts: Dict[str, int] = {}
+    for candidate in failures:
+        reason = str(candidate.get("github_codex_check_error") or "GitHub check failed")
+        reason_counts[reason] = reason_counts.get(reason, 0) + 1
+    reasons = ", ".join(f"{reason} ({count})" for reason, count in sorted(reason_counts.items())[:3])
+    extra = len(reason_counts) - 3
+    if extra > 0:
+        reasons += f", +{extra} more reason(s)"
+    return (
+        f"GitHub check warning: failed for {len(failures)} candidate(s): {reasons}. "
+        "Native Codex detection may be incomplete; local bridge/manual fallbacks are still available."
+    )
 
 
 def render_global_picker(
@@ -4322,16 +4986,9 @@ def render_global_picker(
             lines.append("Clear the filter with / then Enter, or press Tab to change views.")
         else:
             lines.append("No Codex-wide install candidates found.")
-    github_failures = [
-        candidate
-        for candidate in all_candidates
-        if candidate.get("github_codex_check_error")
-        and candidate.get("codex_release_status") != "github-origin-checked-no-native"
-    ]
-    if github_failures:
-        lines.append(
-            f"GitHub check failed for {len(github_failures)} candidate(s); bridge/manual fallbacks remain selectable."
-        )
+    github_warning = github_check_failure_warning(all_candidates)
+    if github_warning:
+        lines.append(github_warning)
     last_group = None
     for offset, candidate in enumerate(page, start=1):
         absolute_index = start + offset - 1
@@ -4644,6 +5301,9 @@ def merge_saved_global_action(fresh: Dict[str, Any], saved: Dict[str, Any]) -> D
         if key.startswith("github_codex_") or key in {
             "codex_release_status",
             "codex_release_evidence",
+            "blocked_reason",
+            "risk_badges",
+            "manual_steps",
             "global_apply_results",
         }:
             merged[key] = value
@@ -4935,11 +5595,42 @@ def apply_selected_global_actions(manifest: Dict[str, Any]) -> List[Dict[str, An
         if action_type == "skill":
             name = str(candidate.get("name") or "")
             source = Path(str(candidate.get("source_path") or "")).expanduser()
+            source_kind = str(candidate.get("skill_source_kind") or "")
+            temp_skill_source: Optional[tempfile.TemporaryDirectory] = None
+            source_resolution = ""
+            used_cache_fallback = False
+            if source_kind == "github-source":
+                temp_skill_source, source_resolution = materialize_github_skill_source(
+                    str(candidate.get("skill_origin_github_repo") or ""),
+                    str(candidate.get("skill_origin_ref") or "HEAD"),
+                    str(candidate.get("skill_origin_subdir") or ""),
+                )
+                if temp_skill_source:
+                    source = Path(temp_skill_source.name) / "__skill_source__"
+                else:
+                    fallback = Path(str(candidate.get("skill_cache_fallback_path") or "")).expanduser()
+                    if fallback.is_dir() and (fallback / "SKILL.md").exists():
+                        source = fallback
+                        source_kind = "claude-cache-fallback"
+                        used_cache_fallback = True
+                    else:
+                        results.append(
+                            {
+                                "id": candidate["id"],
+                                "status": "skipped",
+                                "reason": f"GitHub skill source failed and no cache fallback is available: {source_resolution}",
+                            }
+                        )
+                        continue
             destination = home_dir() / ".codex" / "skills" / name
             if not name or not source.exists():
+                if temp_skill_source:
+                    temp_skill_source.cleanup()
                 results.append({"id": candidate["id"], "status": "skipped", "reason": "missing source skill"})
                 continue
             if destination.exists():
+                if temp_skill_source:
+                    temp_skill_source.cleanup()
                 results.append(
                     {
                         "id": candidate["id"],
@@ -4951,8 +5642,11 @@ def apply_selected_global_actions(manifest: Dict[str, Any]) -> List[Dict[str, An
                 continue
             try:
                 destination.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copytree(source, destination)
+                safe_copy_tree(source, destination, ignore_names=BRIDGE_COPY_IGNORE_NAMES)
             except Exception as exc:
+                shutil.rmtree(destination, ignore_errors=True)
+                if temp_skill_source:
+                    temp_skill_source.cleanup()
                 results.append(
                     {
                         "id": candidate["id"],
@@ -4963,12 +5657,21 @@ def apply_selected_global_actions(manifest: Dict[str, Any]) -> List[Dict[str, An
                     }
                 )
                 continue
+            if temp_skill_source:
+                temp_skill_source.cleanup()
             results.append(
                 {
                     "id": candidate["id"],
                     "status": "ok",
                     "source": str(source),
                     "destination": str(destination),
+                    "source_kind": source_kind or "local",
+                    "source_resolution": source_resolution,
+                    "fallback_reason": (
+                        f"GitHub skill source failed; copied Claude cache fallback: {source_resolution}"
+                        if used_cache_fallback
+                        else ""
+                    ),
                 }
             )
     manifest["global_apply_results"] = results
@@ -5108,14 +5811,16 @@ def wizard_review_sessions(manifest: Dict[str, Any]) -> bool:
             sys.stdout.write(ANSI_CLEAR_VIEWPORT)
         sessions = manifest["claude"]["sessions"]
         print(step_heading("Step 1/4", "Claude Context"))
-        print(f"Project: {manifest['target_path']}")
+        print(f"{label_text('Project:')} {manifest['target_path']}")
         print(f"Selected {sessions.get('selected_count', 0)} of {sessions.get('found_count', 0)} discovered session(s).")
+        if not sessions.get("found_count"):
+            print(conversation_retention_caption())
         selected_count = int(sessions.get("selected_count") or 0)
         if selected_count:
-            print("Selected conversations:")
+            print(color_text("Selected conversations", ANSI_BOLD) + ":")
             limit = None if selected_count <= 12 else 12
-            for bullet in session_bullets(manifest, limit=limit):
-                print("  " + bullet)
+            for bullet in session_bullets(manifest, limit=limit, visual=True):
+                print(f"  {bullet}" if bullet else "")
             if limit is not None and selected_count > limit:
                 print(f"  - +{selected_count - limit} more selected conversation(s)")
         answer = wizard_answer("\nContinue, choose more conversations, skip context, or quit? [Enter/c/s/q] ", "continue")
@@ -5137,25 +5842,48 @@ def wizard_review_sessions(manifest: Dict[str, Any]) -> bool:
         print("Choose Enter, c, s, or q.")
 
 
+def show_project_files_preview(manifest: Dict[str, Any]) -> None:
+    if supports_static_menu():
+        sys.stdout.write(ANSI_CLEAR_VIEWPORT)
+    print(step_heading("Step 2/4", "Project Files Preview"))
+    print(f"{label_text('Project:')} {manifest['target_path']}")
+    print()
+    print(color_text("Human-readable diffs", ANSI_BOLD))
+    diff = render_diff(manifest, include_manifest=False)
+    print(diff or "No AGENTS.md or summary.md diff.")
+    print()
+    print(color_text("Generated JSON artifacts", ANSI_BOLD))
+    for path in manifest["actions"].get("project_writes", []):
+        if path == ".codex/handoff/manifest.json" or path.startswith(".codex/handoff/runs/"):
+            print(f"  {color_text('-', ANSI_GREEN)} {path}")
+    print(muted_text("Machine-readable JSON diffs are omitted from this wizard preview to keep the screen usable."))
+    if supports_static_menu():
+        print()
+        print(muted_text("Press any key to return to Step 2."), flush=True)
+        read_menu_key()
+    else:
+        print()
+
+
 def wizard_apply_project_files(manifest: Dict[str, Any]) -> Tuple[bool, bool]:
     while True:
         if supports_static_menu():
             sys.stdout.write(ANSI_CLEAR_VIEWPORT)
         print(step_heading("Step 2/4", "Project Files"))
-        print(f"Project: {manifest['target_path']}")
-        print("Project-local handoff files to include in the final plan:")
+        print(f"{label_text('Project:')} {manifest['target_path']}")
+        print(f"{label_text('Action:')} Queue project-local handoff files for the final review.")
+        print()
+        print(color_text("Files", ANSI_BOLD))
         for path in manifest["actions"].get("project_writes", []):
-            print(f"  - {path}")
-        print("This does not change ~/.codex and will not be written until the final review step.")
+            print(f"  {color_text('-', ANSI_GREEN)} {path}")
+        print()
+        print(muted_text("Nothing is written in this step. ~/.codex is not changed."))
         answer = wizard_answer("Include project-local files, preview diff, skip, or quit? [Y/p/s/q] ", "y")
         if answer in {"q", "quit"}:
             print("No more changes.")
             return False, False
         if answer in {"p", "preview", "diff"}:
-            diff = render_diff(manifest, include_manifest=False)
-            print()
-            print(diff or "No project-local diff.")
-            print()
+            show_project_files_preview(manifest)
             continue
         if answer in {"s", "skip", "n", "no"}:
             manifest["wizard_project_files_selected"] = False
@@ -5208,7 +5936,7 @@ def bridge_reason_text(candidate: Dict[str, Any]) -> str:
         suffix = f": {truncate(error, 80)}" if error else ""
         return f"bridge fallback; GitHub native-Codex check failed{suffix}"
     if status == "github-native-codex-manifest":
-        return "native Codex manifest detected"
+        return "native Codex manifest detected; bridge fallback not auto-applied"
     if candidate.get("github_codex_checked") and not candidate.get("github_codex_manifest_exists"):
         return "bridge; GitHub source checked, no native Codex plugin manifest found"
     if candidate.get("origin_github_repo"):
@@ -5568,16 +6296,40 @@ def wizard_tooling_progress(lines: List[str], message: str, project_path: str = 
         print(f"  - {message}", flush=True)
 
 
+def wizard_replace_tooling_progress_line(
+    lines: List[str],
+    prefix: str,
+    message: str,
+    project_path: str = "",
+) -> None:
+    if lines and lines[-1].startswith(prefix):
+        lines[-1] = message
+    else:
+        lines.append(message)
+    if supports_static_menu():
+        draw_tooling_progress(lines, project_path=project_path)
+    else:
+        print(f"  - {message}", flush=True)
+
+
 def wizard_github_progress(lines: List[str], index: int, total: int, candidate: Dict[str, Any], project_path: str = "") -> None:
     if total <= 0:
         return
-    if index == 1 or index == total or index % 5 == 0:
-        repo = str(candidate.get("origin_github_repo") or "GitHub origin")
-        wizard_tooling_progress(
+    repo = str(candidate.get("origin_github_repo") or "GitHub origin")
+    if candidate.get("_github_progress_phase") == "result":
+        wizard_replace_tooling_progress_line(
             lines,
-            f"Checking GitHub/Codex compatibility {index}/{total}: {repo}",
+            "Checking GitHub/Codex compatibility ",
+            f"GitHub finding {index}/{total}: {repo} - {github_check_finding_text(candidate)}",
             project_path=project_path,
         )
+        return
+    wizard_replace_tooling_progress_line(
+        lines,
+        "Checking GitHub/Codex compatibility ",
+        f"Checking GitHub/Codex compatibility {index}/{total}: {repo}",
+        project_path=project_path,
+    )
 
 
 def print_tooling_summary_header(manifest: Dict[str, Any]) -> None:
@@ -5883,6 +6635,11 @@ def print_wizard_completion(manifest: Dict[str, Any]) -> None:
     global_results = [item for item in manifest.get("global_apply_results") or [] if isinstance(item, dict)]
     ok_results = [item for item in global_results if item.get("status") == "ok"]
     selected_global = manifest.get("selected_global_actions") or []
+    problem_results = [item for item in global_results if item.get("status") != "ok"]
+    github_warning = github_check_failure_warning(
+        [item for item in manifest.get("_display_global_action_candidates") or manifest.get("global_candidates") or [] if isinstance(item, dict)]
+    )
+    native_followups = native_codex_followup_actions(manifest)
     print()
     print("AI handoff wizard complete.")
     print(f"Project: {manifest['target_path']}")
@@ -5895,40 +6652,65 @@ def print_wizard_completion(manifest: Dict[str, Any]) -> None:
             f"skills={usage_kind_names(usage_summary, 'skills')}; "
             f"plugins={usage_kind_names(usage_summary, 'plugins')}."
         )
+    print()
+    print("Done:")
     if applied_actions:
-        print("Project files updated:")
+        print("- Project files updated:")
         for path in applied_actions:
-            print(f"  - {path}")
+            print(f"    - {path}")
     else:
-        print("Project files updated: none.")
+        print("- Project files updated: none.")
     if ok_results:
-        print("Codex-wide installs completed:")
+        print("- Codex-wide installs completed:")
         actions_by_id = {
             str(item.get("id")): item for item in selected_global if isinstance(item, dict) and item.get("id")
         }
         for result in ok_results:
             action = actions_by_id.get(str(result.get("id")), {"id": result.get("id")})
-            print(f"  - {global_action_display_name(action)}")
-        problem_results = [item for item in global_results if item.get("status") != "ok"]
-        if problem_results:
-            print("Codex-wide install results needing attention:")
-            for result in problem_results:
-                reason = result.get("reason")
-                suffix = f" ({reason})" if reason else ""
-                print(f"  - {result.get('id')}: {result.get('status')}{suffix}")
+            print(f"    - {global_action_display_name(action)}")
+        print("- Open a new Codex session after Codex-wide plugin or skill installs.")
     elif global_results:
-        print("Codex-wide install results needing attention:")
-        for result in global_results:
+        print("- Codex-wide installs completed: none.")
+    elif selected_global:
+        print("- Codex-wide installs completed: none; selections were recorded only.")
+    else:
+        print("- Codex-wide installs: none selected.")
+
+    pending_lines: List[str] = []
+    if problem_results:
+        pending_lines.append("Codex-wide install results needing attention:")
+        for result in problem_results:
             reason = result.get("reason")
             suffix = f" ({reason})" if reason else ""
-            print(f"  - {result.get('id')}: {result.get('status')}{suffix}")
-    elif selected_global:
-        print("Codex-wide installs recorded but not executed:")
+            pending_lines.append(f"  - {result.get('id')}: {result.get('status')}{suffix}")
+    if selected_global and not global_results:
+        pending_lines.append("Codex-wide installs recorded but not executed:")
         for action in selected_global:
             if isinstance(action, dict):
-                print(f"  - {global_action_display_name(action)}")
+                pending_lines.append(f"  - {global_action_display_name(action)}")
+    if native_followups:
+        pending_lines.append("Native Codex plugin install follow-up:")
+        for action in native_followups[:8]:
+            source = str(action.get("origin_github_repo") or action.get("origin_source_url") or action.get("origin_source_path") or "")
+            suffix = f" ({source})" if source else ""
+            pending_lines.append(
+                f"  - {action.get('id')}: install or enable the native Codex package instead of auto-bridging{suffix}"
+            )
+        if len(native_followups) > 8:
+            pending_lines.append(f"  - +{len(native_followups) - 8} more; see .codex/handoff/manifest.json")
+    if github_warning:
+        pending_lines.append(github_warning)
+    if applied_actions:
+        pending_lines.append("Review AGENTS.md and .codex/handoff/manifest.json before relying on the handoff.")
+
+    print()
+    print("Pending user work:")
+    if pending_lines:
+        for line in pending_lines:
+            print(f"- {line}" if not line.startswith("  ") else line)
     else:
-        print("Codex-wide installs: none selected.")
+        print("- None.")
+    print()
     print("Inspect:")
     print(f"  - {shlex.quote(str(Path(manifest['target_path']) / 'AGENTS.md'))}")
     print(f"  - {shlex.quote(str(Path(manifest['target_path']) / '.codex' / 'handoff' / 'summary.md'))}")
@@ -6057,6 +6839,8 @@ def print_conversations(manifest: Dict[str, Any]) -> None:
     print(f"Claude conversations for {manifest['target_path']}")
     print(f"Selection: {sessions.get('selection_strategy')}")
     print(f"Found: {sessions.get('found_count', 0)} | Selected: {sessions.get('selected_count', 0)}")
+    if not sessions.get("found_count"):
+        print(conversation_retention_caption())
     print()
     candidates = sessions.get("candidates") or []
     if not candidates:
@@ -6202,19 +6986,10 @@ def print_globals(
         active_filters.append("checked-github")
     if active_filters:
         print("Filters: " + ", ".join(active_filters))
-    github_failures = []
     if check_github:
-        github_failures = [
-            candidate
-            for candidate in candidates
-            if candidate.get("github_codex_check_error")
-            and candidate.get("codex_release_status") != "github-origin-checked-no-native"
-        ]
-        if github_failures:
-            print(
-                f"GitHub check warning: failed for {len(github_failures)} candidate(s); "
-                "local bridge/manual fallbacks are still available."
-            )
+        github_warning = github_check_failure_warning(candidates)
+        if github_warning:
+            print(github_warning)
     print()
     if not candidates:
         print("No Codex-wide install candidates found.")
@@ -6872,6 +7647,18 @@ def normalize_argv(argv: List[str]) -> List[str]:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    try:
+        return main_unchecked(argv)
+    except KeyboardInterrupt:
+        print("\nInterrupted by user.", file=sys.stderr)
+        return 130
+    finally:
+        if supports_static_menu():
+            sys.stdout.write(ANSI_SHOW_CURSOR)
+            sys.stdout.flush()
+
+
+def main_unchecked(argv: Optional[List[str]] = None) -> int:
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     normalized = normalize_argv(raw_argv)
     if normalized and normalized[0] == "_default":

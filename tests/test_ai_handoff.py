@@ -5,6 +5,7 @@ import importlib.util
 import io
 import json
 import os
+import tarfile
 import tempfile
 import unittest
 from pathlib import Path
@@ -187,7 +188,7 @@ class AiHandoffTests(unittest.TestCase):
                 + "\n"
             )
 
-    def add_installed_claude_plugin_cache(self) -> Path:
+    def add_installed_claude_plugin_cache(self, *, include_native_codex: bool = True) -> Path:
         marketplace_root = self.home / ".claude" / "plugins" / "marketplaces" / "demo-market"
         (marketplace_root / ".claude-plugin").mkdir(parents=True)
         (marketplace_root / ".claude-plugin" / "marketplace.json").write_text(
@@ -210,11 +211,12 @@ class AiHandoffTests(unittest.TestCase):
             '[remote "origin"]\n\turl = https://github.com/acme/demo-market.git\n',
             encoding="utf-8",
         )
-        (marketplace_root / "plugins" / "demo" / ".codex-plugin").mkdir(parents=True)
-        (marketplace_root / "plugins" / "demo" / ".codex-plugin" / "plugin.json").write_text(
-            json.dumps({"name": "demo", "version": "1.0.0", "description": "Native Codex demo"}),
-            encoding="utf-8",
-        )
+        if include_native_codex:
+            (marketplace_root / "plugins" / "demo" / ".codex-plugin").mkdir(parents=True)
+            (marketplace_root / "plugins" / "demo" / ".codex-plugin" / "plugin.json").write_text(
+                json.dumps({"name": "demo", "version": "1.0.0", "description": "Native Codex demo"}),
+                encoding="utf-8",
+            )
         plugin_dir = self.home / ".claude" / "plugins" / "cache" / "demo-market" / "demo" / "1.0.0"
         (plugin_dir / ".claude-plugin").mkdir(parents=True)
         (plugin_dir / ".claude-plugin" / "plugin.json").write_text(
@@ -387,7 +389,19 @@ class AiHandoffTests(unittest.TestCase):
         self.assertIn(self.module.MANAGED_START, agents)
         self.assertIn("Testing work", agents)
         self.assertIn("Codex loads AGENTS.md automatically", agents)
+        self.assertIn("On the first Codex run after this handoff, ask Codex to:", agents)
+        self.assertIn("## Selected Claude Transcript Files", agents)
+        self.assertIn("For deeper context, read the selected Claude transcript JSONL files directly", agents)
+        self.assertIn(str(self.session_path), agents)
+        self.assertIn("Recent prompt: fix the failing tests", agents)
+        self.assertIn("Recent assistant note: Tests now pass.", agents)
+        self.assertIn("Commands seen: pytest tests/test_example.py", agents)
+        self.assertNotIn("telemetry-session-start", agents)
         self.assertIn("No Codex-wide MCP, plugin, or skill installs were executed", agents)
+        self.assertIn(
+            "Recent prompts, assistant notes, commands, and local transcript paths in AGENTS.md and manifest JSON",
+            manifest["privacy"]["written_context"],
+        )
 
     def test_agents_lists_all_selected_conversations(self) -> None:
         manifest = self.module.build_manifest(str(self.project), last=1)
@@ -397,6 +411,7 @@ class AiHandoffTests(unittest.TestCase):
             item = dict(base)
             item["session_id"] = f"session-{index}"
             item["title"] = f"conversation {index}"
+            item["custom_title"] = f"conversation {index}"
             selected.append(item)
         manifest["claude"]["sessions"]["selected"] = selected
         manifest["claude"]["sessions"]["selected_count"] = len(selected)
@@ -408,6 +423,37 @@ class AiHandoffTests(unittest.TestCase):
         self.assertIn("Selected sessions: 10 of 10 discovered.", agents)
         self.assertIn("conversation 0", agents)
         self.assertIn("conversation 9", agents)
+
+    def test_agents_transcript_file_section_handles_missing_paths(self) -> None:
+        manifest = self.module.build_manifest(str(self.project), last=1)
+        for session in manifest["claude"]["sessions"]["selected"]:
+            session.pop("transcript_path", None)
+
+        agents = self.module.render_agents_managed_section(manifest)
+
+        self.assertIn("## Selected Claude Transcript Files", agents)
+        self.assertIn("No transcript file paths were captured", agents)
+
+    def test_agents_conversation_context_is_compact_and_filters_hook_noise(self) -> None:
+        manifest = self.module.build_manifest(str(self.project), last=1)
+        selected = manifest["claude"]["sessions"]["selected"][0]
+        selected["first_prompt"] = "line one\nline two"
+        selected["transcript"]["user_prompts"] = ["recent\nprompt"]
+        selected["transcript"]["assistant_notes"] = ["assistant\nnote"]
+        selected["transcript"]["commands"] = [
+            "bash ${CLAUDE_PLUGIN_ROOT}/hooks/telemetry-session-start.sh",
+            "Loading work context...\nexport PATH=\"$PATH\"\n_C=\"${CLAUDE_CONFIG_DIR:-$HOME/.claude}\"",
+            "pytest tests/test_example.py",
+        ]
+
+        agents = self.module.render_agents_managed_section(manifest)
+
+        self.assertIn("First prompt: line one line two", agents)
+        self.assertIn("Recent prompt: recent prompt", agents)
+        self.assertIn("Recent assistant note: assistant note", agents)
+        self.assertIn("Commands seen: pytest tests/test_example.py", agents)
+        self.assertNotIn("CLAUDE_PLUGIN_ROOT", agents)
+        self.assertNotIn("Loading work context", agents)
 
     def test_agents_embeds_claude_md_source_for_first_run_distillation(self) -> None:
         (self.project / "CLAUDE.md").write_text(
@@ -424,9 +470,9 @@ class AiHandoffTests(unittest.TestCase):
 
         self.assertIn("## First-Run Codex Distillation", agents)
         self.assertIn("This AGENTS.md section was generated by ai-handoff", agents)
-        self.assertIn("First ask Codex to:", agents)
+        self.assertIn("On the first Codex run after this handoff, ask Codex to:", agents)
         self.assertIn("Edit AGENTS.md outside the ai-handoff managed markers", agents)
-        self.assertIn("merge any rules found in CLAUDE.md", agents)
+        self.assertIn("merge any rules found in CLAUDE.md, Claude settings, or selected conversations", agents)
         self.assertIn("ghost rules", agents)
         self.assertIn("## CLAUDE.md Source Snapshot", agents)
         self.assertIn("Never touch generated reports.", agents)
@@ -441,8 +487,49 @@ class AiHandoffTests(unittest.TestCase):
 
         agents = self.module.render_agents_managed_section(manifest)
 
-        self.assertNotIn("## First-Run Codex Distillation", agents)
+        self.assertIn("## First-Run Codex Distillation", agents)
+        self.assertIn("No CLAUDE.md source snapshot was available", agents)
+        self.assertIn("No CLAUDE.md was found; use selected conversations", agents)
         self.assertNotIn("## CLAUDE.md Source Snapshot", agents)
+
+    def test_summary_uses_project_snapshot_instead_of_readiness_failures(self) -> None:
+        (self.project / "CLAUDE.md").unlink()
+        manifest = self.module.build_manifest(str(self.project), last=1)
+
+        summary = self.module.render_summary(manifest)
+
+        self.assertIn("## Project Snapshot", summary)
+        self.assertIn("CLAUDE.md source: not present for this project", summary)
+        self.assertIn("Existing AGENTS.md before handoff: not present; handoff will create it", summary)
+        self.assertNotIn("## Project Readiness", summary)
+        self.assertNotIn("CLAUDE.md: missing", summary)
+
+    def test_agents_mentions_native_codex_plugin_install_followup(self) -> None:
+        self.add_installed_claude_plugin_cache()
+        manifest = self.module.build_manifest(str(self.project), last=1)
+
+        agents = self.module.render_agents_managed_section(manifest)
+
+        self.assertIn("Native Codex plugin install follow-up", agents)
+        self.assertIn("plugin:demo@demo-market", agents)
+        self.assertIn("install or enable the native Codex package instead of auto-bridging", agents)
+
+    def test_agents_keeps_native_followup_when_other_action_selected(self) -> None:
+        self.add_installed_claude_plugin_cache()
+        manifest = self.module.build_manifest(str(self.project), last=1)
+        manifest["selected_global_action_ids"] = ["skill:sample-skill"]
+        manifest["selected_global_actions"] = [
+            candidate
+            for candidate in self.module.global_action_candidates(manifest)
+            if candidate["id"] == "skill:sample-skill"
+        ]
+
+        agents = self.module.render_agents_managed_section(manifest)
+
+        self.assertIn("Selected Codex-wide actions were recorded but not installed", agents)
+        self.assertIn("skill:sample-skill copied as sample-skill", agents)
+        self.assertIn("Native Codex plugin install follow-up", agents)
+        self.assertIn("plugin:demo@demo-market", agents)
 
     def test_agents_reports_installed_codex_wide_actions(self) -> None:
         manifest = self.module.build_manifest(str(self.project), last=1)
@@ -528,8 +615,22 @@ class AiHandoffTests(unittest.TestCase):
 
         self.assertEqual(code, 0)
         self.assertIn("Claude conversations for", stdout.getvalue())
+        self.assertNotIn("cleanupPeriodDays", stdout.getvalue())
         self.assertIn("session-1", stdout.getvalue())
         self.assertIn("--sessions session-1", stdout.getvalue())
+
+    def test_dry_run_zero_sessions_mentions_cleanup_period(self) -> None:
+        manifest = self.module.build_manifest(str(self.project), last=1)
+        manifest["claude"]["sessions"]["found_count"] = 0
+        manifest["claude"]["sessions"]["selected_count"] = 0
+        manifest["claude"]["sessions"]["selected"] = []
+        stdout = io.StringIO()
+
+        with contextlib.redirect_stdout(stdout):
+            self.module.print_dry_run(manifest)
+
+        self.assertIn("sessions found: 0", stdout.getvalue())
+        self.assertIn("cleanupPeriodDays", stdout.getvalue())
 
     def test_all_projects_conversations_can_find_moved_project_sessions(self) -> None:
         moved_dir = self.home / ".claude" / "projects" / "-Users-omri-Code-old-project"
@@ -620,6 +721,150 @@ class AiHandoffTests(unittest.TestCase):
         loose = next(item for item in manifest["claude"]["sessions"]["candidates"] if item["session_id"] == "loose-session")
         self.assertIn("new loose transcript work", loose["first_prompt"])
 
+    def test_loose_jsonl_sessions_use_prompt_and_timestamps_without_index(self) -> None:
+        project = self.root / "raw-project"
+        project.mkdir()
+        sessions_dir = self.home / ".claude" / "projects" / self.module.claude_project_key(project)
+        sessions_dir.mkdir(parents=True)
+        session_path = sessions_dir / "raw-session.jsonl"
+        session_path.write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "type": "attachment",
+                            "timestamp": "2026-05-31T08:00:00Z",
+                            "cwd": str(project.resolve()),
+                            "gitBranch": "main",
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "user",
+                            "isMeta": True,
+                            "message": {
+                                "role": "user",
+                                "content": "<local-command-caveat>ignore this</local-command-caveat>",
+                            },
+                            "timestamp": "2026-05-31T08:00:01Z",
+                            "cwd": str(project.resolve()),
+                            "gitBranch": "main",
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "user",
+                            "message": {"role": "user", "content": "ship the plugin release"},
+                            "timestamp": "2026-05-31T08:01:00Z",
+                            "cwd": str(project.resolve()),
+                            "gitBranch": "main",
+                        }
+                    ),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        manifest = self.module.build_manifest(str(project), last=1)
+
+        candidate = manifest["claude"]["sessions"]["candidates"][0]
+        self.assertEqual(candidate["title"], "ship the plugin release")
+        self.assertEqual(candidate["modified"], "2026-05-31T08:01:00Z")
+        self.assertNotEqual(candidate["title"], "Untitled")
+
+    def test_loose_jsonl_command_only_sessions_use_command_label(self) -> None:
+        sessions_dir = self.home / ".claude" / "projects" / self.module.claude_project_key(self.project)
+        session_path = sessions_dir / "command-only.jsonl"
+        session_path.write_text(
+            json.dumps(
+                {
+                    "type": "user",
+                    "message": {
+                        "role": "user",
+                        "content": "<command-name>/plugin</command-name>\n<command-message>plugin</command-message>",
+                    },
+                    "timestamp": "2026-05-31T08:01:00Z",
+                    "cwd": str(self.project.resolve()),
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        entry = self.module.loose_session_entry(
+            session_path,
+            self.module.claude_project_key(self.project),
+            self.project.resolve(),
+        )
+
+        self.assertEqual(entry["firstPrompt"], "/plugin")
+
+    def test_loose_jsonl_sessions_use_slug_as_custom_title(self) -> None:
+        session_path = self.home / ".claude" / "projects" / self.module.claude_project_key(self.project) / "renamed.jsonl"
+        session_path.write_text(
+            json.dumps(
+                {
+                    "type": "user",
+                    "message": {"role": "user", "content": "long first prompt should become description"},
+                    "timestamp": "2026-05-31T08:01:00Z",
+                    "cwd": str(self.project.resolve()),
+                    "slug": "release-plan",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        entry = self.module.loose_session_entry(
+            session_path,
+            self.module.claude_project_key(self.project),
+            self.project.resolve(),
+        )
+
+        self.assertEqual(entry["slug"], "release-plan")
+        self.assertEqual(self.module.entry_session_custom_title(entry), "release plan")
+
+    def test_loose_jsonl_sessions_use_rename_reminder_as_custom_title(self) -> None:
+        session_path = self.home / ".claude" / "projects" / self.module.claude_project_key(self.project) / "named.jsonl"
+        session_path.write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "type": "user",
+                            "message": {"role": "user", "content": "start with this request"},
+                            "timestamp": "2026-05-31T08:01:00Z",
+                            "cwd": str(self.project.resolve()),
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "user",
+                            "isMeta": True,
+                            "message": {
+                                "role": "user",
+                                "content": '<system-reminder>The user named this session "release-plan". This may indicate the session focus.</system-reminder>',
+                            },
+                            "timestamp": "2026-05-31T08:02:00Z",
+                            "cwd": str(self.project.resolve()),
+                        }
+                    ),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        entry = self.module.loose_session_entry(
+            session_path,
+            self.module.claude_project_key(self.project),
+            self.project.resolve(),
+        )
+
+        self.assertEqual(entry["namedTitle"], "release-plan")
+        self.assertEqual(self.module.entry_session_custom_title(entry), "release-plan")
+
     def test_diff_command_previews_project_writes(self) -> None:
         stdout = io.StringIO()
         with contextlib.redirect_stdout(stdout):
@@ -672,6 +917,8 @@ class AiHandoffTests(unittest.TestCase):
         auth.assert_called()
         self.assertIn("checked-github", stdout.getvalue())
         self.assertIn("GitHub check warning: failed for", stdout.getvalue())
+        self.assertIn("gh CLI not found", stdout.getvalue())
+        self.assertIn("Native Codex detection may be incomplete", stdout.getvalue())
         self.assertIn(
             "GitHub check failed. Keeping Claude-to-Codex bridge candidate. Reason: gh CLI not found",
             stdout.getvalue(),
@@ -716,11 +963,16 @@ class AiHandoffTests(unittest.TestCase):
 
         self.assertTrue(plugin["bridge"])
         self.assertEqual(plugin["bridge_name"], "cc-demo")
-        self.assertEqual(plugin["bridge_source_path"], str(plugin_dir))
-        self.assertEqual(plugin["blocked_reason"], "")
+        self.assertEqual(plugin["bridge_source_kind"], "github-source")
+        self.assertEqual(plugin["bridge_source_path"], "https://github.com/acme/demo-market.git")
+        self.assertEqual(plugin["bridge_cache_fallback_path"], str(plugin_dir))
+        self.assertIn("native Codex plugin metadata was found", plugin["blocked_reason"])
         self.assertIn("bridge", plugin["risk_badges"])
+        self.assertIn("marketplace", plugin["risk_badges"])
+        self.assertIn("git-source", plugin["risk_badges"])
+        self.assertIn("network", plugin["risk_badges"])
         self.assertIn("codex-native", plugin["risk_badges"])
-        self.assertIn("Claude installed cache fallback", plugin["evidence"])
+        self.assertIn("GitHub source plugin", plugin["evidence"])
         self.assertEqual(plugin["origin_github_repo"], "acme/demo-market")
         self.assertEqual(plugin["codex_release_status"], "native-codex-source")
         self.assertIn("plugins/demo/.codex-plugin/plugin.json", plugin["codex_release_check_urls"][0])
@@ -730,7 +982,7 @@ class AiHandoffTests(unittest.TestCase):
         source_dir = self.home / ".claude" / "plugins" / "marketplaces" / "demo-market" / "plugins" / "demo"
         (source_dir / ".claude-plugin").mkdir(parents=True, exist_ok=True)
         (source_dir / ".claude-plugin" / "plugin.json").write_text(
-            json.dumps({"name": "demo", "version": "1.0.0", "description": "Source Claude demo"}),
+            json.dumps({"name": "demo", "version": "2.0.0", "description": "Source Claude demo"}),
             encoding="utf-8",
         )
 
@@ -741,10 +993,251 @@ class AiHandoffTests(unittest.TestCase):
             if item["id"] == "plugin:demo@demo-market"
         )
 
-        self.assertEqual(plugin["bridge_source_kind"], "source-repo")
+        self.assertEqual(plugin["bridge_source_kind"], "marketplace-source")
         self.assertEqual(plugin["bridge_source_path"], str(source_dir.resolve()))
         self.assertEqual(plugin["bridge_cache_fallback_path"], str(cache_dir))
-        self.assertIn("source repo plugin", plugin["evidence"])
+        self.assertEqual(plugin["bridge_source_version"], "2.0.0")
+        self.assertEqual(plugin["bridge_cache_version"], "1.0.0")
+        self.assertTrue(plugin["bridge_cache_stale"])
+        self.assertIn("marketplace source plugin", plugin["evidence"])
+        self.assertIn("marketplace", plugin["risk_badges"])
+        self.assertIn("git-source", plugin["risk_badges"])
+        self.assertIn("cache version 1.0.0 differs from source version 2.0.0", plugin["evidence"])
+
+    def test_plugin_url_source_is_remote_not_fake_local_source_path(self) -> None:
+        self.add_installed_claude_plugin_cache()
+        marketplace = self.home / ".claude" / "plugins" / "marketplaces" / "demo-market"
+        data = json.loads((marketplace / ".claude-plugin" / "marketplace.json").read_text(encoding="utf-8"))
+        data["plugins"].append(
+            {
+                "name": "remote-demo",
+                "source": {"source": "url", "url": "https://github.com/acme/remote-demo.git"},
+            }
+        )
+        (marketplace / ".claude-plugin" / "marketplace.json").write_text(json.dumps(data), encoding="utf-8")
+        cache_dir = self.home / ".claude" / "plugins" / "cache" / "demo-market" / "remote-demo" / "1.0.0"
+        (cache_dir / ".claude-plugin").mkdir(parents=True)
+        (cache_dir / ".claude-plugin" / "plugin.json").write_text(
+            json.dumps({"name": "remote-demo", "version": "1.0.0", "description": "cached remote"}),
+            encoding="utf-8",
+        )
+        installed_path = self.home / ".claude" / "plugins" / "installed_plugins.json"
+        installed = json.loads(installed_path.read_text(encoding="utf-8"))
+        installed["plugins"]["remote-demo@demo-market"] = [
+            {
+                "scope": "user",
+                "installPath": str(cache_dir),
+                "version": "1.0.0",
+                "gitCommitSha": "0123456789abcdef",
+            }
+        ]
+        installed_path.write_text(json.dumps(installed), encoding="utf-8")
+
+        manifest = self.module.build_manifest(str(self.project), last=1)
+        plugin = next(
+            item
+            for item in self.module.global_action_candidates(manifest)
+            if item["id"] == "plugin:remote-demo@demo-market"
+        )
+
+        self.assertEqual(plugin["origin_github_repo"], "acme/remote-demo")
+        self.assertEqual(plugin["origin_source_path"], "")
+        self.assertEqual(plugin["bridge_source_kind"], "github-source")
+        self.assertEqual(plugin["bridge_source_path"], "https://github.com/acme/remote-demo.git")
+        self.assertEqual(plugin["bridge_cache_fallback_path"], str(cache_dir))
+        self.assertIn("GitHub source plugin", plugin["evidence"])
+        self.assertIn("network", plugin["risk_badges"])
+        self.assertIn("git-source", plugin["risk_badges"])
+
+    def test_remote_plugin_source_without_cache_is_still_github_source_candidate(self) -> None:
+        self.add_installed_claude_plugin_cache(include_native_codex=False)
+        marketplace = self.home / ".claude" / "plugins" / "marketplaces" / "demo-market"
+        data = json.loads((marketplace / ".claude-plugin" / "marketplace.json").read_text(encoding="utf-8"))
+        data["plugins"].append(
+            {
+                "name": "remote-no-cache",
+                "source": {"source": "url", "url": "https://github.com/acme/remote-no-cache.git"},
+            }
+        )
+        (marketplace / ".claude-plugin" / "marketplace.json").write_text(json.dumps(data), encoding="utf-8")
+        installed_path = self.home / ".claude" / "plugins" / "installed_plugins.json"
+        installed = json.loads(installed_path.read_text(encoding="utf-8"))
+        installed["plugins"]["remote-no-cache@demo-market"] = [
+            {
+                "scope": "user",
+                "installPath": str(self.home / ".claude" / "plugins" / "cache" / "missing"),
+                "version": "1.0.0",
+                "gitCommitSha": "0123456789abcdef",
+            }
+        ]
+        installed_path.write_text(json.dumps(installed), encoding="utf-8")
+
+        manifest = self.module.build_manifest(str(self.project), last=1)
+        plugin = next(
+            item
+            for item in self.module.global_action_candidates(manifest)
+            if item["id"] == "plugin:remote-no-cache@demo-market"
+        )
+
+        self.assertTrue(plugin["bridge"])
+        self.assertEqual(plugin["bridge_source_kind"], "github-source")
+        self.assertEqual(plugin["bridge_remote_repo"], "acme/remote-no-cache")
+        self.assertEqual(plugin["bridge_cache_fallback_path"], "")
+        self.assertIn("no Claude cache fallback is available", plugin["evidence"])
+
+    def test_skill_copy_prefers_formal_source_path_over_claude_cache(self) -> None:
+        cache_skill = self.home / ".claude" / "skills" / "sample-skill" / "SKILL.md"
+        source_skill_dir = self.root / "source-skills" / "sample-skill"
+        source_skill_dir.mkdir(parents=True)
+        (source_skill_dir.parent / ".git").mkdir()
+        (source_skill_dir.parent / ".git" / "config").write_text(
+            '[remote "origin"]\n\turl = git@github.com:acme/source-skills.git\n',
+            encoding="utf-8",
+        )
+        source_skill = source_skill_dir / "SKILL.md"
+        source_skill.write_text(
+            "---\nname: sample-skill\ndescription: source skill\n---\n\nUse source instructions.\n",
+            encoding="utf-8",
+        )
+        cache_skill.write_text(
+            (
+                "---\n"
+                "name: sample-skill\n"
+                "description: cache skill\n"
+                f"source_path: {source_skill_dir}\n"
+                "---\n\nUse stale cache instructions.\n"
+            ),
+            encoding="utf-8",
+        )
+
+        manifest = self.module.build_manifest(str(self.project), last=1)
+        skill = next(
+            item
+            for item in self.module.global_action_candidates(manifest)
+            if item["id"] == "skill:sample-skill"
+        )
+
+        self.assertEqual(skill["skill_source_kind"], "source-repo")
+        self.assertEqual(skill["source_path"], str(source_skill_dir))
+        self.assertEqual(skill["skill_origin_github_repo"], "acme/source-skills")
+        self.assertEqual(skill["skill_cache_fallback_path"], str(cache_skill.parent))
+        self.assertIn("git-source", skill["risk_badges"])
+        self.assertIn("skill source repo", skill["evidence"])
+
+        manifest["selected_global_action_ids"] = ["skill:sample-skill"]
+        results = self.module.apply_selected_global_actions(manifest)
+
+        self.assertEqual(results[0]["status"], "ok")
+        copied = self.home / ".codex" / "skills" / "sample-skill" / "SKILL.md"
+        self.assertIn("Use source instructions.", copied.read_text(encoding="utf-8"))
+        self.assertNotIn("Use stale cache instructions.", copied.read_text(encoding="utf-8"))
+
+    def test_skill_copy_materializes_github_source_before_cache_fallback(self) -> None:
+        cache_skill = self.home / ".claude" / "skills" / "sample-skill" / "SKILL.md"
+        cache_skill.write_text(
+            (
+                "---\n"
+                "name: sample-skill\n"
+                "description: cache skill\n"
+                "repo: acme/sample-skill\n"
+                "---\n\nUse stale cache instructions.\n"
+            ),
+            encoding="utf-8",
+        )
+        manifest = self.module.build_manifest(str(self.project), last=1)
+        skill = next(
+            item
+            for item in self.module.global_action_candidates(manifest)
+            if item["id"] == "skill:sample-skill"
+        )
+        self.assertEqual(skill["skill_source_kind"], "github-source")
+        self.assertEqual(skill["skill_origin_github_repo"], "acme/sample-skill")
+        self.assertIn("git-source", skill["risk_badges"])
+        self.assertIn("GitHub skill source", skill["evidence"])
+
+        temp_source = tempfile.TemporaryDirectory()
+        source_dir = Path(temp_source.name) / "__skill_source__"
+        source_dir.mkdir()
+        (source_dir / "SKILL.md").write_text(
+            "---\nname: sample-skill\ndescription: remote\n---\n\nUse remote source instructions.\n",
+            encoding="utf-8",
+        )
+        manifest["selected_global_action_ids"] = ["skill:sample-skill"]
+        with mock.patch.object(self.module, "materialize_github_skill_source", return_value=(temp_source, "")):
+            results = self.module.apply_selected_global_actions(manifest)
+
+        self.assertEqual(results[0]["status"], "ok")
+        copied = self.home / ".codex" / "skills" / "sample-skill" / "SKILL.md"
+        self.assertIn("Use remote source instructions.", copied.read_text(encoding="utf-8"))
+        self.assertNotIn("Use stale cache instructions.", copied.read_text(encoding="utf-8"))
+
+    def test_skill_copy_reports_cache_fallback_when_github_source_fails(self) -> None:
+        cache_skill = self.home / ".claude" / "skills" / "sample-skill" / "SKILL.md"
+        cache_skill.write_text(
+            (
+                "---\n"
+                "name: sample-skill\n"
+                "description: cache skill\n"
+                "repo: acme/sample-skill\n"
+                "---\n\nUse cache fallback instructions.\n"
+            ),
+            encoding="utf-8",
+        )
+        manifest = self.module.build_manifest(str(self.project), last=1)
+        manifest["selected_global_action_ids"] = ["skill:sample-skill"]
+
+        with mock.patch.object(self.module, "materialize_github_skill_source", return_value=(None, "gh failed")):
+            results = self.module.apply_selected_global_actions(manifest)
+
+        self.assertEqual(results[0]["status"], "ok")
+        self.assertEqual(results[0]["source_kind"], "claude-cache-fallback")
+        self.assertIn("gh failed", results[0]["fallback_reason"])
+        copied = self.home / ".codex" / "skills" / "sample-skill" / "SKILL.md"
+        self.assertIn("Use cache fallback instructions.", copied.read_text(encoding="utf-8"))
+
+    def test_safe_extract_rejects_archive_links(self) -> None:
+        payload = io.BytesIO()
+        with tarfile.open(fileobj=payload, mode="w") as archive:
+            member = tarfile.TarInfo("unsafe-link")
+            member.type = tarfile.SYMTYPE
+            member.linkname = "/tmp/outside"
+            archive.addfile(member)
+
+        with self.assertRaises(self.module.HandoffError) as raised:
+            self.module.safe_extract_tar_bytes(payload.getvalue(), self.root / "extract")
+
+        self.assertIn("archive link", str(raised.exception))
+
+    @unittest.skipUnless(hasattr(os, "symlink"), "symlink support required")
+    def test_skill_copy_rejects_symlinked_source_content(self) -> None:
+        cache_skill = self.home / ".claude" / "skills" / "sample-skill" / "SKILL.md"
+        source_skill_dir = self.root / "source-skills" / "sample-skill"
+        source_skill_dir.mkdir(parents=True)
+        (source_skill_dir / "SKILL.md").write_text(
+            "---\nname: sample-skill\ndescription: source skill\n---\n\nUse source instructions.\n",
+            encoding="utf-8",
+        )
+        outside = self.root / "outside-secret.txt"
+        outside.write_text("do not copy\n", encoding="utf-8")
+        os.symlink(outside, source_skill_dir / "linked-secret.txt")
+        cache_skill.write_text(
+            (
+                "---\n"
+                "name: sample-skill\n"
+                "description: cache skill\n"
+                f"source_path: {source_skill_dir}\n"
+                "---\n\nUse stale cache instructions.\n"
+            ),
+            encoding="utf-8",
+        )
+
+        manifest = self.module.build_manifest(str(self.project), last=1)
+        manifest["selected_global_action_ids"] = ["skill:sample-skill"]
+        results = self.module.apply_selected_global_actions(manifest)
+
+        self.assertEqual(results[0]["status"], "error")
+        self.assertIn("symlink", results[0]["reason"])
+        self.assertFalse((self.home / ".codex" / "skills" / "sample-skill").exists())
 
     def test_github_codex_check_marks_native_manifest(self) -> None:
         self.add_installed_claude_plugin_cache()
@@ -820,7 +1313,7 @@ class AiHandoffTests(unittest.TestCase):
         self.assertNotIn("codex-native", checked["risk_badges"])
 
     def test_selected_plugin_bridge_writes_codex_plugin_agent_and_registry(self) -> None:
-        self.add_installed_claude_plugin_cache()
+        self.add_installed_claude_plugin_cache(include_native_codex=False)
         manifest = self.module.build_manifest(str(self.project), last=1)
         manifest["selected_global_action_ids"] = ["plugin:demo@demo-market"]
 
@@ -862,7 +1355,7 @@ class AiHandoffTests(unittest.TestCase):
         self.assertIn("cc-demo", [item["name"] for item in registry["plugins"]])
 
     def test_selected_plugin_bridge_reports_partial_when_codex_install_fails(self) -> None:
-        self.add_installed_claude_plugin_cache()
+        self.add_installed_claude_plugin_cache(include_native_codex=False)
         manifest = self.module.build_manifest(str(self.project), last=1)
         manifest["selected_global_action_ids"] = ["plugin:demo@demo-market"]
 
@@ -884,6 +1377,24 @@ class AiHandoffTests(unittest.TestCase):
         self.assertEqual(results[0]["status"], "partial")
         self.assertEqual(results[0]["reason"], "failed")
         self.assertTrue((self.home / ".codex" / "plugins" / "cc-demo").exists())
+
+    @unittest.skipUnless(hasattr(os, "symlink"), "symlink support required")
+    def test_selected_plugin_bridge_rejects_symlinked_source_content(self) -> None:
+        plugin_dir = self.add_installed_claude_plugin_cache(include_native_codex=False)
+        outside = self.root / "outside-secret.txt"
+        outside.write_text("do not copy\n", encoding="utf-8")
+        os.symlink(outside, plugin_dir / "scripts" / "linked-secret.txt")
+        manifest = self.module.build_manifest(str(self.project), last=1)
+        manifest["selected_global_action_ids"] = ["plugin:demo@demo-market"]
+
+        with mock.patch.object(self.module, "materialize_github_source", return_value=(None, "gh failed")):
+            with mock.patch.object(self.module, "install_bridged_plugin") as install:
+                results = self.module.apply_selected_global_actions(manifest)
+
+        self.assertEqual(results[0]["status"], "error")
+        self.assertIn("symlink", results[0]["reason"])
+        self.assertFalse((self.home / ".codex" / "plugins" / "cc-demo").exists())
+        install.assert_not_called()
 
     def test_interactive_global_picker_checks_github_origins(self) -> None:
         self.add_installed_claude_plugin_cache()
@@ -923,6 +1434,31 @@ class AiHandoffTests(unittest.TestCase):
 
         self.assertTrue(selected[0]["github_codex_checked"])
         self.assertEqual(selected[0]["codex_release_status"], "github-origin-checked-no-native")
+
+    def test_saved_github_native_candidate_keeps_manual_block_on_apply(self) -> None:
+        self.add_installed_claude_plugin_cache()
+        manifest = self.module.build_manifest(str(self.project), last=1)
+        saved = next(
+            item
+            for item in self.module.global_action_candidates(manifest)
+            if item["id"] == "plugin:demo@demo-market"
+        )
+        saved["github_codex_checked"] = True
+        saved["codex_release_status"] = "github-native-codex-manifest"
+        saved["blocked_reason"] = "native Codex plugin metadata was found on GitHub"
+        saved["risk_badges"] = list(dict.fromkeys([*saved.get("risk_badges", []), "codex-native"]))
+        saved["manual_steps"] = ["install native Codex package"]
+        manifest["selected_global_action_ids"] = ["plugin:demo@demo-market"]
+        manifest["selected_global_actions"] = [saved]
+
+        selected = self.module.selected_global_candidates(manifest)
+        results = self.module.apply_selected_global_actions(manifest)
+
+        self.assertEqual(selected[0]["codex_release_status"], "github-native-codex-manifest")
+        self.assertIn("native Codex", selected[0]["blocked_reason"])
+        self.assertEqual(results[0]["status"], "skipped")
+        self.assertIn("native Codex", results[0]["reason"])
+        self.assertFalse((self.home / ".codex" / "plugins" / "cc-demo").exists())
 
     def test_globals_project_only_filters_global_inventory(self) -> None:
         (self.project / ".mcp.json").write_text(
@@ -1295,6 +1831,41 @@ class AiHandoffTests(unittest.TestCase):
         self.assertTrue(rendered.startswith(self.module.ANSI_CLEAR_VIEWPORT))
         self.assertIn("Step 1/4: Claude Context", rendered)
         self.assertIn(f"Project: {self.project.resolve()}", rendered)
+        self.assertIn("Conversation 1", rendered)
+        self.assertIn("  Time: 2026-05-30T10:05:00Z", rendered)
+        self.assertIn("  Description: Testing work", rendered)
+        self.assertNotIn("  Summary:", rendered)
+        self.assertNotIn("cleanupPeriodDays", rendered)
+        self.assertNotIn("  \n", rendered)
+
+    def test_session_bullets_uses_custom_title_without_duplicate_description(self) -> None:
+        manifest = self.module.build_manifest(str(self.project), last=1)
+        selected = manifest["claude"]["sessions"]["selected"][0]
+        selected["custom_title"] = "Release planning"
+        selected["title"] = "Release planning"
+        selected["summary"] = "Release planning"
+
+        rendered = "\n".join(self.module.session_bullets(manifest, limit=None))
+
+        self.assertIn("Conversation 1: Release planning", rendered)
+        self.assertNotIn("Description: Release planning", rendered)
+
+    def test_session_bullets_visual_mode_adds_dividers_and_color_labels(self) -> None:
+        manifest = self.module.build_manifest(str(self.project), last=1)
+        first = manifest["claude"]["sessions"]["selected"][0]
+        second = dict(first)
+        second["session_id"] = "session-2"
+        second["custom_title"] = "Follow-up"
+        second["summary"] = "Follow-up work"
+        manifest["claude"]["sessions"]["selected"] = [first, second]
+
+        with mock.patch.object(self.module, "supports_color", return_value=True):
+            rendered = "\n".join(self.module.session_bullets(manifest, limit=None, visual=True))
+
+        self.assertIn(self.module.ANSI_BOLD + "Conversation 1" + self.module.ANSI_RESET, rendered)
+        self.assertIn(self.module.ANSI_DIM + ("-" * 54) + self.module.ANSI_RESET, rendered)
+        self.assertIn(self.module.ANSI_CYAN + "Time:" + self.module.ANSI_RESET, rendered)
+        self.assertIn(self.module.ANSI_CYAN + "Description:" + self.module.ANSI_RESET, rendered)
 
     def test_wizard_project_files_step_clears_previous_step_in_static_mode(self) -> None:
         manifest = self.module.build_manifest(str(self.project), last=1)
@@ -1327,6 +1898,43 @@ class AiHandoffTests(unittest.TestCase):
         self.assertFalse((self.project / "AGENTS.md").exists())
         self.assertFalse((self.project / ".codex" / "handoff" / "manifest.json").exists())
 
+    def test_wizard_project_files_preview_lists_json_artifacts_without_full_manifest_diff(self) -> None:
+        manifest = self.module.build_manifest(str(self.project), last=1)
+        stdout = io.StringIO()
+
+        with contextlib.redirect_stdout(stdout):
+            self.module.show_project_files_preview(manifest)
+
+        rendered = stdout.getvalue()
+        self.assertIn("Step 2/4: Project Files Preview", rendered)
+        self.assertIn("Human-readable diffs", rendered)
+        self.assertIn("--- a/AGENTS.md", rendered)
+        self.assertIn("--- a/.codex/handoff/summary.md", rendered)
+        self.assertIn("Generated JSON artifacts", rendered)
+        self.assertIn(".codex/handoff/manifest.json", rendered)
+        self.assertIn(".codex/handoff/runs/", rendered)
+        self.assertIn("Machine-readable JSON diffs are omitted", rendered)
+        self.assertNotIn("--- a/.codex/handoff/manifest.json", rendered)
+        self.assertNotIn("--- a/.codex/handoff/runs/", rendered)
+
+    def test_wizard_project_files_preview_waits_before_static_redraw(self) -> None:
+        manifest = self.module.build_manifest(str(self.project), last=1)
+        stdout = io.StringIO()
+        answers = iter(["p", "q"])
+
+        with mock.patch.object(self.module, "supports_static_menu", return_value=True):
+            with mock.patch.object(self.module, "wizard_answer", side_effect=lambda *args: next(answers)):
+                with mock.patch.object(self.module, "read_menu_key", return_value="done") as read_key:
+                    with contextlib.redirect_stdout(stdout):
+                        continued, applied = self.module.wizard_apply_project_files(manifest)
+
+        self.assertFalse(continued)
+        self.assertFalse(applied)
+        read_key.assert_called_once()
+        rendered = stdout.getvalue()
+        self.assertIn("Step 2/4: Project Files Preview", rendered)
+        self.assertIn("Press any key to return to Step 2.", rendered)
+
     def test_wizard_shows_selected_conversations_after_picker(self) -> None:
         manifest = self.module.build_manifest(str(self.project), last=1)
         answers = iter(["c", "q"])
@@ -1342,6 +1950,7 @@ class AiHandoffTests(unittest.TestCase):
                 item = dict(base)
                 item["session_id"] = f"session-{index}"
                 item["title"] = f"conversation {index}"
+                item["custom_title"] = f"conversation {index}"
                 item["modified"] = f"2026-05-30T{index:02d}:00:00Z"
                 selected.append(item)
             picker_manifest["claude"]["sessions"]["selected"] = selected
@@ -1503,6 +2112,94 @@ class AiHandoffTests(unittest.TestCase):
         self.assertIn(f"Project: {self.project.resolve()}", rendered)
         self.assertIn("[info] Scanning selected Claude conversations", rendered)
 
+    def test_github_progress_updates_current_line_without_throttled_jumps(self) -> None:
+        progress_lines = ["Found 14 possible carryover action(s); 14 need GitHub/Codex compatibility checks."]
+        stdout = io.StringIO()
+
+        candidates = [
+            {"origin_github_repo": "acme/one"},
+            {"origin_github_repo": "acme/two"},
+            {"origin_github_repo": "acme/three"},
+        ]
+        with mock.patch.object(self.module, "supports_static_menu", return_value=True):
+            with contextlib.redirect_stdout(stdout):
+                for index, candidate in enumerate(candidates, start=1):
+                    self.module.wizard_github_progress(
+                        progress_lines,
+                        index,
+                        14,
+                        candidate,
+                        project_path=str(self.project.resolve()),
+                    )
+
+        self.assertEqual(len(progress_lines), 2)
+        self.assertEqual(progress_lines[-1], "Checking GitHub/Codex compatibility 3/14: acme/three")
+        rendered = stdout.getvalue()
+        self.assertIn("Checking GitHub/Codex compatibility 1/14: acme/one", rendered)
+        self.assertIn("Checking GitHub/Codex compatibility 2/14: acme/two", rendered)
+        self.assertIn("Checking GitHub/Codex compatibility 3/14: acme/three", rendered)
+
+    def test_github_progress_replaces_checking_line_with_finding(self) -> None:
+        progress_lines = ["Found 1 possible carryover action(s); 1 need GitHub/Codex compatibility checks."]
+        stdout = io.StringIO()
+
+        with mock.patch.object(self.module, "supports_static_menu", return_value=True):
+            with contextlib.redirect_stdout(stdout):
+                self.module.wizard_github_progress(
+                    progress_lines,
+                    1,
+                    1,
+                    {"origin_github_repo": "acme/demo", "_github_progress_phase": "checking"},
+                    project_path=str(self.project.resolve()),
+                )
+                self.module.wizard_github_progress(
+                    progress_lines,
+                    1,
+                    1,
+                    {
+                        "origin_github_repo": "acme/demo",
+                        "_github_progress_phase": "result",
+                        "codex_release_status": "github-origin-checked-no-native",
+                    },
+                    project_path=str(self.project.resolve()),
+                )
+
+        self.assertEqual(len(progress_lines), 2)
+        self.assertEqual(
+            progress_lines[-1],
+            "GitHub finding 1/1: acme/demo - no native Codex manifest found; Claude-to-Codex bridge remains the path",
+        )
+        self.assertNotIn("Checking GitHub/Codex compatibility", progress_lines[-1])
+
+    def test_github_annotation_progress_emits_checking_and_result_events(self) -> None:
+        events = []
+        candidate = {
+            "id": "plugin:demo@market",
+            "origin_github_repo": "acme/demo",
+            "origin_subdir": "./plugins/demo",
+            "codex_release_check_urls": [
+                "https://github.com/acme/demo/blob/HEAD/plugins/demo/.codex-plugin/plugin.json"
+            ],
+            "risk_badges": [],
+            "bridge": True,
+        }
+
+        with mock.patch.object(
+            self.module,
+            "gh_auth_status",
+            return_value={"available": True, "authenticated": True, "path": "/usr/bin/gh", "reason": ""},
+        ):
+            with mock.patch.object(self.module, "gh_api_path_exists", return_value=(False, "gh: Not Found (HTTP 404)")):
+                self.module.annotate_github_codex_releases(
+                    [candidate],
+                    progress=lambda index, total, item: events.append(
+                        (index, total, item.get("_github_progress_phase"), item.get("codex_release_status"))
+                    ),
+                )
+
+        self.assertEqual(events[0], (1, 1, "checking", None))
+        self.assertEqual(events[1], (1, 1, "result", "github-origin-checked-no-native"))
+
     def test_color_text_uses_ansi_only_when_supported(self) -> None:
         with mock.patch.object(self.module, "supports_color", return_value=False):
             self.assertEqual(self.module.color_text("hello", self.module.ANSI_GREEN), "hello")
@@ -1511,6 +2208,33 @@ class AiHandoffTests(unittest.TestCase):
                 self.module.color_text("hello", self.module.ANSI_GREEN),
                 f"{self.module.ANSI_GREEN}hello{self.module.ANSI_RESET}",
             )
+
+    def test_supports_color_can_be_forced_when_no_color_is_set(self) -> None:
+        class FakeStdout:
+            def isatty(self) -> bool:
+                return True
+
+        with mock.patch.object(self.module.sys, "stdout", FakeStdout()):
+            with mock.patch.dict(
+                self.module.os.environ,
+                {"TERM": "xterm-256color", "NO_COLOR": "1", "AI_HANDOFF_COLOR": "always"},
+                clear=False,
+            ):
+                self.assertTrue(self.module.supports_color())
+
+    def test_supports_color_respects_no_color_by_default(self) -> None:
+        class FakeStdout:
+            def isatty(self) -> bool:
+                return True
+
+        with mock.patch.object(self.module.sys, "stdout", FakeStdout()):
+            with mock.patch.dict(
+                self.module.os.environ,
+                {"TERM": "xterm-256color", "NO_COLOR": "1"},
+                clear=False,
+            ):
+                self.module.os.environ.pop("AI_HANDOFF_COLOR", None)
+                self.assertFalse(self.module.supports_color())
 
     def test_tooling_line_explains_bridge_when_github_has_no_native_manifest(self) -> None:
         line = self.module.tooling_candidate_line(
@@ -1645,10 +2369,13 @@ class AiHandoffTests(unittest.TestCase):
 
         rendered = stdout.getvalue()
         self.assertIn("Confidence:", rendered)
+        self.assertIn("Done:", rendered)
         self.assertIn("Project files updated:", rendered)
         self.assertIn("AGENTS.md", rendered)
         self.assertIn("Codex-wide installs completed:", rendered)
         self.assertIn("plugin:x@omri-cc-stuff bridged as cc-x", rendered)
+        self.assertIn("Pending user work:", rendered)
+        self.assertIn("Review AGENTS.md", rendered)
 
     def test_wizard_completion_lists_failed_install_results(self) -> None:
         manifest = self.module.build_manifest(str(self.project), last=1)
@@ -1667,6 +2394,27 @@ class AiHandoffTests(unittest.TestCase):
         self.assertIn("Codex-wide install results needing attention:", rendered)
         self.assertIn("partial (codex plugin add failed)", rendered)
         self.assertNotIn("selected but not executed", rendered)
+
+    def test_wizard_completion_lists_recorded_and_native_pending_work(self) -> None:
+        self.add_installed_claude_plugin_cache()
+        manifest = self.module.build_manifest(str(self.project), last=1)
+        selected = [
+            candidate
+            for candidate in self.module.global_action_candidates(manifest)
+            if candidate["id"] == "plugin:demo@demo-market"
+        ]
+        manifest["selected_global_actions"] = selected
+        manifest["selected_global_action_ids"] = ["plugin:demo@demo-market"]
+        manifest["global_apply_results"] = []
+        stdout = io.StringIO()
+
+        with contextlib.redirect_stdout(stdout):
+            self.module.print_wizard_completion(manifest)
+
+        rendered = stdout.getvalue()
+        self.assertIn("Codex-wide installs recorded but not executed:", rendered)
+        self.assertIn("Native Codex plugin install follow-up:", rendered)
+        self.assertIn("install or enable the native Codex package", rendered)
 
     def test_static_menu_draw_clears_viewport_when_supported(self) -> None:
         manifest = self.module.build_manifest(str(self.project), last=1)
@@ -1712,9 +2460,54 @@ class AiHandoffTests(unittest.TestCase):
 
         self.assertIn("Filter: testing", rendered)
         self.assertIn(f"Project: {self.project.resolve()}", rendered)
+        self.assertNotIn("cleanupPeriodDays", rendered)
         self.assertIn("Page: 1/1", rendered)
-        self.assertIn("[x] Testing work", rendered)
+        self.assertIn("[x] Conversation 1", rendered)
+        self.assertIn("branch main", rendered)
+        self.assertIn("2 messages", rendered)
+        self.assertIn("Description: Testing work", rendered)
+        self.assertIn("e expand", rendered)
+        self.assertIn("Enter hand off 1 selected", rendered)
         self.assertIn("--all-projects --search TEXT", rendered)
+
+    def test_session_picker_expands_highlighted_conversation_context(self) -> None:
+        manifest = self.module.build_manifest(str(self.project), last=1)
+
+        rendered = self.module.render_session_picker(
+            manifest,
+            cursor=0,
+            selected_ids=["session-1"],
+            expanded_ids={"session-1"},
+        )
+
+        self.assertIn("Context:", rendered)
+        self.assertIn("Session ID: session-1", rendered)
+        self.assertIn("Project:", rendered)
+        self.assertIn("Recent request: fix the failing tests", rendered)
+        self.assertIn("Recent assistant note: Tests now pass.", rendered)
+        self.assertNotIn("Commands: pytest tests/test_example.py", rendered)
+
+    def test_session_picker_uses_custom_title_when_available(self) -> None:
+        manifest = self.module.build_manifest(str(self.project), last=1)
+        candidate = manifest["claude"]["sessions"]["candidates"][0]
+        candidate["custom_title"] = "Release planning"
+        candidate["title"] = "Release planning"
+        candidate["summary"] = "Release planning"
+
+        rendered = self.module.render_session_picker(manifest, cursor=0, selected_ids=["session-1"])
+
+        self.assertIn("[x] Release planning", rendered)
+        self.assertNotIn("Description: Release planning", rendered)
+
+    def test_session_picker_empty_state_mentions_cleanup_period(self) -> None:
+        manifest = self.module.build_manifest(str(self.project), last=1)
+        manifest["claude"]["sessions"]["candidates"] = []
+        manifest["claude"]["sessions"]["found_count"] = 0
+
+        rendered = self.module.render_session_picker(manifest)
+
+        self.assertIn("No Claude conversations found", rendered)
+        self.assertIn("cleanupPeriodDays", rendered)
 
     def test_global_picker_render_filters_and_paginates(self) -> None:
         manifest = self.module.build_manifest(str(self.project), last=1)
@@ -1732,6 +2525,16 @@ class AiHandoffTests(unittest.TestCase):
         self.assertIn("Filter: experimental", rendered)
         self.assertIn("[x] plugin:experimental@marketplace", rendered)
         self.assertIn("Manual / Unsafe:", rendered)
+
+    def test_global_picker_renders_marketplace_badge_for_marketplace_plugins(self) -> None:
+        self.add_installed_claude_plugin_cache()
+        manifest = self.module.build_manifest(str(self.project), last=1)
+
+        rendered = self.module.render_global_picker(manifest, cursor=0, filter_text="demo-market", mode="plugin")
+
+        self.assertIn("plugin:demo@demo-market", rendered)
+        self.assertIn("marketplace", rendered)
+        self.assertIn("git-source", rendered)
 
     def test_global_picker_used_mode_only_shows_transcript_used_candidates(self) -> None:
         self.append_transcript_usage_events()
@@ -1869,6 +2672,17 @@ class AiHandoffTests(unittest.TestCase):
             self.module.normalize_argv([str(self.project), "help"]),
             ["_default", str(self.project), "--help"],
         )
+
+    def test_main_handles_keyboard_interrupt_gracefully(self) -> None:
+        stderr = io.StringIO()
+
+        with mock.patch.object(self.module, "command_scan", side_effect=KeyboardInterrupt):
+            with contextlib.redirect_stderr(stderr):
+                code = self.module.main([str(self.project)])
+
+        self.assertEqual(code, 130)
+        self.assertIn("Interrupted by user.", stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
 
 
 if __name__ == "__main__":
