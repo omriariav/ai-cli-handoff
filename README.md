@@ -6,7 +6,7 @@ The first supported flow is `Claude Code -> Codex`: when Claude Code context exi
 
 For that flow, the CLI reads the target folder, selected Claude Code conversations, `CLAUDE.md`, local Claude setup, and discovered MCP/skill/plugin usage. It then creates Codex-ready handoff artifacts such as `AGENTS.md` and `.codex/handoff/manifest.json`. Optional Codex user-level tooling carryover is reviewed separately and never runs by accident.
 
-Current version: `0.1.0`
+Current version: `0.2.0`
 
 ## Quick Start
 
@@ -32,7 +32,7 @@ The default command opens a one-time wizard. It does not write files or install 
 
 ## What It Does
 
-`ai-handoff` is built around handoff flows. In `0.1.0`, the implemented flow is `Claude Code -> Codex`.
+`ai-handoff` is built around handoff flows. In `0.2.0`, the implemented flow is `Claude Code -> Codex`.
 
 That flow prepares a project for Codex by:
 
@@ -40,6 +40,7 @@ That flow prepares a project for Codex by:
 - Letting you choose more conversations with a static checkbox picker.
 - Summarizing recent Claude work into Codex-readable context.
 - Carrying `CLAUDE.md` guidance into a managed `AGENTS.md` section, including a first-run instruction for Codex to distill durable project rules.
+- Listing the selected Claude transcript JSONL files in `AGENTS.md` so Codex can read the exact chosen conversations when it needs deeper context.
 - Writing `.codex/handoff/summary.md`, `.codex/handoff/manifest.json`, and run snapshots.
 - Detecting MCPs, Claude skills, Claude plugins, hooks, rules, references, and statusline settings.
 - Scanning selected transcripts for tooling that was actually used, not just installed somewhere.
@@ -169,12 +170,14 @@ Claude skills can be copied into `~/.codex/skills` when selected. Existing Codex
 
 ### Plugins
 
-Claude plugin records are not assumed to be Codex plugins. In `0.1.0`, `ai-handoff` uses this order:
+Claude plugin records are not assumed to be Codex plugins. In `0.2.0`, `ai-handoff` uses this order:
 
-1. Detect native Codex plugin metadata when the source repo exposes `.codex-plugin/plugin.json`, and surface that evidence for review.
-2. Bridge from the source repo at the Claude-used ref when available.
-3. If source resolution fails, bridge from the installed Claude cache as a labeled fallback.
-4. If neither source nor cache exists, report a manual action with the reason.
+1. Resolve the formal Claude source first: a local marketplace/source repo, a cloned GitHub marketplace, or a remote GitHub source URL.
+2. Detect native Codex plugin metadata when the source exposes `.codex-plugin/plugin.json`, and surface that evidence for review.
+3. Bridge from the authoritative source when `.claude-plugin/plugin.json` is available locally.
+4. For remote GitHub sources, materialize the GitHub repo at the Claude-used ref during the approved install step.
+5. Use the installed Claude cache only as a labeled fallback, with the fallback reason and stale-cache evidence recorded in the manifest.
+6. If neither source nor cache exists, report a manual action with the reason.
 
 For bridged plugins, `ai-handoff` writes `~/.codex/plugins/cc-<name>`, strips Claude-only runtime metadata, converts Claude commands into Codex-visible skills, converts Claude agents into Codex TOML agents, adds bridge metadata, updates the local marketplace registry, and then runs `codex plugin add cc-<name>@cc-bridged-plugins` only after explicit approval.
 
@@ -260,6 +263,7 @@ bin/ai-handoff show <run-id> --path /path/to/project
 - `ai-handoff` updates only the managed section between markers.
 - The managed section includes a first-run Codex distillation prompt plus a best-effort-redacted `CLAUDE.md` source snapshot.
 - The first ask tells Codex to read selected conversations, captured Claude setup, and the `CLAUDE.md` snapshot, then edit durable project context outside the managed markers.
+- The managed section lists selected Claude transcript JSONL paths so Codex can open the chosen transcripts directly when summaries are not enough.
 - That distillation should merge rules from `CLAUDE.md` and Claude permission settings while dropping stale, duplicated, or one-off handoff details.
 - Keep durable project rules outside the managed section.
 
@@ -334,23 +338,26 @@ python3 ~/.codex/skills/.system/skill-creator/scripts/quick_validate.py ~/.codex
 
 ## Release Checklist
 
-Version `0.1.0` is declared in:
+Version `0.2.0` is declared in:
 
 - `pyproject.toml`
 - `src/ai_handoff/__init__.py`
+- `README.md`
+- `README.html`
 - the CLI `--version` output
 
 Before tagging:
 
 ```bash
 python3 -m unittest discover -s tests
+pandoc README.md -o README.html --metadata title='AI CLI Handoff'
 git status --short
-git tag -a v0.1.0 -m "ai-handoff 0.1.0"
-git push origin v0.1.0
+git tag -a v0.2.0 -m "ai-handoff 0.2.0"
+git push origin v0.2.0
 ```
 
 Recommended order: merge the PR first, then tag the merge commit on `main`.
 
 ## Status
 
-`0.1.0` is the first usable release of the generic handoff CLI, with `Claude Code -> Codex` as the first supported flow. The reverse `Codex -> Claude Code` flow is intentionally visible in the wizard but not implemented yet.
+`0.2.0` improves source preference for Claude tooling carryover. The CLI now prefers formal plugin and skill sources over installed Claude cache copies, records evidence for the chosen source, and labels cache fallback clearly. `Claude Code -> Codex` remains the first supported flow; the reverse `Codex -> Claude Code` flow is intentionally visible in the wizard but not implemented yet.

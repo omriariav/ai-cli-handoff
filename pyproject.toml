@@ -1,6 +1,6 @@
 [project]
 name = "ai-cli-handoff"
-version = "0.1.0"
+version = "0.2.0"
 description = "Prepare Claude Code projects for Codex handoff."
 requires-python = ">=3.9"
 

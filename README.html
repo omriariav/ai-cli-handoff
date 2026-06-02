@@ -1,0 +1,370 @@
+<h1 id="ai-cli-handoff">AI CLI Handoff</h1>
+<p><code>ai-handoff</code> is an AI agent handoff CLI for carrying
+project context, guidance, and tooling between coding assistants.</p>
+<p>The first supported flow is <code>Claude Code -&gt; Codex</code>:
+when Claude Code context exists, Claude rate limits are gone, and you
+want Codex to continue from the same project reality instead of starting
+cold.</p>
+<p>For that flow, the CLI reads the target folder, selected Claude Code
+conversations, <code>CLAUDE.md</code>, local Claude setup, and
+discovered MCP/skill/plugin usage. It then creates Codex-ready handoff
+artifacts such as <code>AGENTS.md</code> and
+<code>.codex/handoff/manifest.json</code>. Optional Codex user-level
+tooling carryover is reviewed separately and never runs by accident.</p>
+<p>Current version: <code>0.2.0</code></p>
+<h2 id="quick-start">Quick Start</h2>
+<p>From this repository:</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="ex">bin/ai-handoff</span> /path/to/project</span></code></pre></div>
+<p>Installed as a Python package:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="ex">ai-handoff</span> /path/to/project</span></code></pre></div>
+<p>Example:</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="ex">bin/ai-handoff</span> /Users/omri.a/Code/speech-to-text-tools</span></code></pre></div>
+<p>The default command opens a one-time wizard. It does not write files
+or install Codex-wide tooling until the final review step.</p>
+<h2 id="what-it-does">What It Does</h2>
+<p><code>ai-handoff</code> is built around handoff flows. In
+<code>0.2.0</code>, the implemented flow is
+<code>Claude Code -&gt; Codex</code>.</p>
+<p>That flow prepares a project for Codex by:</p>
+<ul>
+<li>Selecting recent Claude Code conversations, defaulting to the latest
+three relevant sessions.</li>
+<li>Letting you choose more conversations with a static checkbox
+picker.</li>
+<li>Summarizing recent Claude work into Codex-readable context.</li>
+<li>Carrying <code>CLAUDE.md</code> guidance into a managed
+<code>AGENTS.md</code> section, including a first-run instruction for
+Codex to distill durable project rules.</li>
+<li>Listing the selected Claude transcript JSONL files in
+<code>AGENTS.md</code> so Codex can read the exact chosen conversations
+when it needs deeper context.</li>
+<li>Writing <code>.codex/handoff/summary.md</code>,
+<code>.codex/handoff/manifest.json</code>, and run snapshots.</li>
+<li>Detecting MCPs, Claude skills, Claude plugins, hooks, rules,
+references, and statusline settings.</li>
+<li>Scanning selected transcripts for tooling that was actually used,
+not just installed somewhere.</li>
+<li>Checking whether used Claude plugins already exist in Codex.</li>
+<li>Checking GitHub origins for native Codex plugin metadata when
+<code>gh</code> is available and authenticated.</li>
+<li>Proposing safe carryover paths: flag native Codex metadata for
+review, bridge from source, bridge from Claude cache, or report why
+manual work is required.</li>
+</ul>
+<h2 id="the-wizard">The Wizard</h2>
+<p>The interactive flow is optimized for a one-time handoff.</p>
+<h3 id="step-0-handoff-direction">Step 0: Handoff Direction</h3>
+<p>Choose the flow:</p>
+<ul>
+<li><code>Claude Code -&gt; Codex</code>: supported now.</li>
+<li><code>Codex -&gt; Claude Code</code>: planned for later.</li>
+</ul>
+<p>Every step shows the current project folder so it is clear which repo
+is being prepared.</p>
+<h3 id="step-14-claude-context">Step 1/4: Claude Context</h3>
+<p>The wizard starts with the latest three relevant Claude Code
+conversations. You can continue, skip context, or choose more
+conversations.</p>
+<p>The conversation picker supports:</p>
+<ul>
+<li><code>/</code>: filter conversations.</li>
+<li><code>f</code> / <code>b</code>: page forward and back.</li>
+<li><code>d</code>: details.</li>
+<li>Space or row numbers: toggle visible rows.</li>
+<li>Enter: commit the draft selection.</li>
+<li><code>q</code>: cancel without changing the previous selection.</li>
+</ul>
+<p>If you select 10 of 10 conversations, the wizard shows the selected
+set instead of hiding it behind the original defaults.</p>
+<h3 id="step-24-project-files">Step 2/4: Project Files</h3>
+<p>The wizard shows the project-local files that can be written:</p>
+<ul>
+<li><code>AGENTS.md</code></li>
+<li><code>.codex/handoff/summary.md</code></li>
+<li><code>.codex/handoff/manifest.json</code></li>
+<li><code>.codex/handoff/runs/&lt;run-id&gt;.json</code></li>
+</ul>
+<p>This step queues the project files only. It does not write them yet.
+You can preview the diff, include them in the final plan, skip them, or
+quit.</p>
+<h3 id="step-34-tooling-claude-setup-carryover">Step 3/4: Tooling &amp;
+Claude Setup Carryover</h3>
+<p>The wizard scans selected transcripts and leads with tooling that was
+actually used in those conversations. That keeps the main path relevant
+to the current project rather than dumping every global Claude plugin
+and skill on the machine.</p>
+<p>It also captures Claude setup that Codex should know about:</p>
+<ul>
+<li>Hooks: captured for review only because they can run commands.</li>
+<li>Rules: recorded and summarized for Codex.</li>
+<li>References: paths are recorded; external references are not copied
+automatically.</li>
+<li>Statusline: captured only because Codex does not currently use
+Claude statusline rendering.</li>
+</ul>
+<p>Conversation-detected tooling appears in a checkbox picker. By
+default, detected tools are selected unless they are already available
+in Codex.</p>
+<p>After choosing tools, you choose the scope:</p>
+<ul>
+<li>Project-only: record selected carryover in the handoff artifacts. No
+<code>~/.codex</code> changes.</li>
+<li>Install for this Codex user: queue user-level Codex installs under
+<code>~/.codex</code>.</li>
+</ul>
+<p>Step 3 still only queues intent. It does not write project files and
+does not install anything.</p>
+<h3 id="step-44-review-run-plan">Step 4/4: Review &amp; Run Plan</h3>
+<p>The final screen summarizes the whole plan:</p>
+<ul>
+<li>Project folder.</li>
+<li>Handoff flow.</li>
+<li>Selected conversation count.</li>
+<li>Project files included or skipped.</li>
+<li>Selected tooling and scope.</li>
+<li>Already-available Codex tooling.</li>
+<li>Captured Claude setup.</li>
+<li>Artifact paths.</li>
+</ul>
+<p>You can preview the final diff, run, or quit.</p>
+<p>If the plan includes Codex user-level installs, Enter is not enough.
+You must type <code>install</code> because those actions can change
+<code>~/.codex</code> and affect every Codex project for the OS
+user.</p>
+<h2 id="safety-model">Safety Model</h2>
+<p><code>ai-handoff</code> separates project-local writes from Codex
+user-level changes.</p>
+<p>Project-local writes:</p>
+<ul>
+<li>Stay inside the target project.</li>
+<li>Update only the managed <code>ai-handoff</code> section in
+<code>AGENTS.md</code>.</li>
+<li>Write handoff artifacts under <code>.codex/handoff/</code>.</li>
+<li>Are safe to inspect with <code>diff</code> before applying.</li>
+</ul>
+<p>Codex user-level changes:</p>
+<ul>
+<li>Write under <code>~/.codex</code> or run <code>codex mcp add</code>
+/ <code>codex plugin add</code>.</li>
+<li>Affect every Codex project for that OS user.</li>
+<li>Are never executed by the default scan.</li>
+<li>Are never authorized by <code>--yes</code> alone.</li>
+<li>Require explicit selection and final confirmation.</li>
+<li>Require typing <code>install</code> in the wizard when user-level
+installs are queued.</li>
+</ul>
+<p>Privacy handling:</p>
+<ul>
+<li>Claude prompts, summaries, commands, local paths, MCP names, skill
+names, plugin names, and nearby Claude project keys may be written to
+the manifest.</li>
+<li>Secrets are best-effort redacted.</li>
+<li>Non-interactive apply requires <code>--ack-privacy</code> when
+private Claude-derived context or local inventory may be persisted.</li>
+<li>Use <code>privacy</code> before applying if you want a clear list of
+categories that may be written.</li>
+</ul>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="ex">bin/ai-handoff</span> privacy /path/to/project</span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="ex">bin/ai-handoff</span> diff /path/to/project <span class="at">--include-manifest</span></span></code></pre></div>
+<h2 id="tooling-carryover">Tooling Carryover</h2>
+<p>Tooling carryover is deliberately conservative.</p>
+<h3 id="mcps">MCPs</h3>
+<p>MCP candidates come from Claude configuration. Selected MCP imports
+run the corresponding <code>codex mcp add ...</code> command only after
+explicit user-level install approval. Commands containing redacted
+secrets are skipped and reported as manual follow-up.</p>
+<h3 id="skills">Skills</h3>
+<p>Claude skills can be copied into <code>~/.codex/skills</code> when
+selected. Existing Codex skill destinations are skipped rather than
+overwritten.</p>
+<h3 id="plugins">Plugins</h3>
+<p>Claude plugin records are not assumed to be Codex plugins. In
+<code>0.2.0</code>, <code>ai-handoff</code> uses this order:</p>
+<ol type="1">
+<li>Resolve the formal Claude source first: a local marketplace/source
+repo, a cloned GitHub marketplace, or a remote GitHub source URL.</li>
+<li>Detect native Codex plugin metadata when the source exposes
+<code>.codex-plugin/plugin.json</code>, and surface that evidence for
+review.</li>
+<li>Bridge from the authoritative source when
+<code>.claude-plugin/plugin.json</code> is available locally.</li>
+<li>For remote GitHub sources, materialize the GitHub repo at the
+Claude-used ref during the approved install step.</li>
+<li>Use the installed Claude cache only as a labeled fallback, with the
+fallback reason and stale-cache evidence recorded in the manifest.</li>
+<li>If neither source nor cache exists, report a manual action with the
+reason.</li>
+</ol>
+<p>For bridged plugins, <code>ai-handoff</code> writes
+<code>~/.codex/plugins/cc-&lt;name&gt;</code>, strips Claude-only
+runtime metadata, converts Claude commands into Codex-visible skills,
+converts Claude agents into Codex TOML agents, adds bridge metadata,
+updates the local marketplace registry, and then runs
+<code>codex plugin add cc-&lt;name&gt;@cc-bridged-plugins</code> only
+after explicit approval.</p>
+<p>GitHub origin checks are on by default for the wizard and
+<code>globals</code> listing. They require <code>gh</code> to be
+installed and authenticated. If <code>gh</code> is missing,
+unauthenticated, or the API check fails, the CLI says so and keeps the
+bridge/manual fallback visible.</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="ex">bin/ai-handoff</span> globals /path/to/project</span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="ex">bin/ai-handoff</span> globals /path/to/project <span class="at">--no-check-github</span></span></code></pre></div>
+<h2 id="commands">Commands</h2>
+<h3 id="interactive">Interactive</h3>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="ex">bin/ai-handoff</span> /path/to/project</span></code></pre></div>
+<h3 id="scan-and-inspect">Scan And Inspect</h3>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="ex">bin/ai-handoff</span> scan /path/to/project</span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="ex">bin/ai-handoff</span> scan /path/to/project <span class="at">--json</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a><span class="ex">bin/ai-handoff</span> diff /path/to/project</span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a><span class="ex">bin/ai-handoff</span> diff /path/to/project <span class="at">--include-manifest</span></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a><span class="ex">bin/ai-handoff</span> privacy /path/to/project</span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a><span class="ex">bin/ai-handoff</span> doctor /path/to/project</span></code></pre></div>
+<h3 id="conversations">Conversations</h3>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="ex">bin/ai-handoff</span> conversations /path/to/project</span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="ex">bin/ai-handoff</span> conversations /path/to/project <span class="at">--all-projects</span> <span class="at">--search</span> TEXT</span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a><span class="ex">bin/ai-handoff</span> scan /path/to/project <span class="at">--sessions</span> session-1,session-7</span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a><span class="ex">bin/ai-handoff</span> scan /path/to/project <span class="at">--from-claude-project</span> <span class="at">-Users-you-Code-old-project</span></span></code></pre></div>
+<p>Useful filters:</p>
+<ul>
+<li><code>--last N</code>: select the latest N sessions.</li>
+<li><code>--since 7d</code>: select sessions newer than a duration.</li>
+<li><code>--sessions id1,id2</code>: select exact sessions.</li>
+<li><code>--all-projects</code>: search across all Claude project
+folders.</li>
+<li><code>--from-claude-project KEY</code>: read from a specific Claude
+project key.</li>
+<li><code>--search TEXT</code>: filter by title, prompt, path, branch,
+or project key.</li>
+<li><code>--branch NAME</code>: filter by git branch.</li>
+<li><code>--include-transcripts</code>: include fuller redacted
+transcript excerpts.</li>
+</ul>
+<h3 id="project-local-apply">Project-Local Apply</h3>
+<div class="sourceCode" id="cb9"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="ex">bin/ai-handoff</span> apply /path/to/project <span class="at">--yes</span> <span class="at">--ack-privacy</span></span></code></pre></div>
+<p>This writes project-local handoff files only. It does not install
+MCPs, skills, or plugins into <code>~/.codex</code>.</p>
+<h3 id="codex-user-level-tooling">Codex User-Level Tooling</h3>
+<div class="sourceCode" id="cb10"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="ex">bin/ai-handoff</span> globals /path/to/project</span>
+<span id="cb10-2"><a href="#cb10-2" aria-hidden="true" tabindex="-1"></a><span class="ex">bin/ai-handoff</span> globals /path/to/project <span class="at">--project-only</span></span>
+<span id="cb10-3"><a href="#cb10-3" aria-hidden="true" tabindex="-1"></a><span class="ex">bin/ai-handoff</span> globals /path/to/project <span class="at">--portable-only</span></span>
+<span id="cb10-4"><a href="#cb10-4" aria-hidden="true" tabindex="-1"></a><span class="ex">bin/ai-handoff</span> globals /path/to/project <span class="at">--include-risky</span></span>
+<span id="cb10-5"><a href="#cb10-5" aria-hidden="true" tabindex="-1"></a><span class="ex">bin/ai-handoff</span> globals select /path/to/project <span class="at">--select</span> skill:name,mcp:name <span class="at">--yes</span> <span class="at">--ack-privacy</span></span>
+<span id="cb10-6"><a href="#cb10-6" aria-hidden="true" tabindex="-1"></a><span class="ex">bin/ai-handoff</span> globals apply /path/to/project</span></code></pre></div>
+<p><code>globals select</code> records intent in
+<code>.codex/handoff/manifest.json</code>. It does not write
+<code>AGENTS.md</code> and does not install anything.
+<code>globals apply</code> executes previously selected user-level
+actions after confirmation.</p>
+<h3 id="history">History</h3>
+<div class="sourceCode" id="cb11"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="ex">bin/ai-handoff</span> history /path/to/project</span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a><span class="ex">bin/ai-handoff</span> show <span class="op">&lt;</span>run-id<span class="op">&gt;</span> --path /path/to/project</span></code></pre></div>
+<h2 id="generated-files">Generated Files</h2>
+<p><code>AGENTS.md</code></p>
+<ul>
+<li>Codex reads this automatically as project instructions.</li>
+<li><code>ai-handoff</code> updates only the managed section between
+markers.</li>
+<li>The managed section includes a first-run Codex distillation prompt
+plus a best-effort-redacted <code>CLAUDE.md</code> source snapshot.</li>
+<li>The first ask tells Codex to read selected conversations, captured
+Claude setup, and the <code>CLAUDE.md</code> snapshot, then edit durable
+project context outside the managed markers.</li>
+<li>The managed section lists selected Claude transcript JSONL paths so
+Codex can open the chosen transcripts directly when summaries are not
+enough.</li>
+<li>That distillation should merge rules from <code>CLAUDE.md</code> and
+Claude permission settings while dropping stale, duplicated, or one-off
+handoff details.</li>
+<li>Keep durable project rules outside the managed section.</li>
+</ul>
+<p><code>.codex/handoff/summary.md</code></p>
+<ul>
+<li>Human-readable handoff summary.</li>
+<li>Includes selected conversations, recent work, commands detected, and
+captured setup notes.</li>
+</ul>
+<p><code>.codex/handoff/manifest.json</code></p>
+<ul>
+<li>Machine-readable audit trail.</li>
+<li>Includes selected session IDs, transcript usage summaries, global
+tooling candidates, selected carryover, diagnostics, and privacy
+metadata.</li>
+</ul>
+<p><code>.codex/handoff/runs/&lt;run-id&gt;.json</code></p>
+<ul>
+<li>Immutable run snapshot for history and debugging.</li>
+</ul>
+<h2 id="installation">Installation</h2>
+<p>For local development, no third-party runtime dependencies are
+required.</p>
+<div class="sourceCode" id="cb12"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="fu">git</span> clone https://github.com/omriariav/ai-cli-handoff.git</span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> ai-cli-handoff</span>
+<span id="cb12-3"><a href="#cb12-3" aria-hidden="true" tabindex="-1"></a><span class="ex">bin/ai-handoff</span> <span class="at">--version</span></span></code></pre></div>
+<p>Install as a Python package:</p>
+<div class="sourceCode" id="cb13"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb13-1"><a href="#cb13-1" aria-hidden="true" tabindex="-1"></a><span class="ex">python3</span> <span class="at">-m</span> pip install .</span>
+<span id="cb13-2"><a href="#cb13-2" aria-hidden="true" tabindex="-1"></a><span class="ex">ai-handoff</span> <span class="at">--version</span></span></code></pre></div>
+<p>Install the bundled Codex skill manually:</p>
+<div class="sourceCode" id="cb14"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span class="fu">mkdir</span> <span class="at">-p</span> ~/.codex/skills/ai-handoff</span>
+<span id="cb14-2"><a href="#cb14-2" aria-hidden="true" tabindex="-1"></a><span class="fu">cp</span> <span class="at">-R</span> skills/ai-handoff/<span class="pp">*</span> ~/.codex/skills/ai-handoff/</span></code></pre></div>
+<h2 id="development">Development</h2>
+<p>Run the test suite:</p>
+<div class="sourceCode" id="cb15"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a><span class="ex">python3</span> <span class="at">-m</span> unittest discover <span class="at">-s</span> tests</span></code></pre></div>
+<p>Compile-check the bundled script and package implementation:</p>
+<div class="sourceCode" id="cb16"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb16-1"><a href="#cb16-1" aria-hidden="true" tabindex="-1"></a><span class="fu">env</span> PYTHONPYCACHEPREFIX=/private/tmp/ai-handoff-pyc <span class="dt">\</span></span>
+<span id="cb16-2"><a href="#cb16-2" aria-hidden="true" tabindex="-1"></a>  python3 <span class="at">-m</span> py_compile <span class="dt">\</span></span>
+<span id="cb16-3"><a href="#cb16-3" aria-hidden="true" tabindex="-1"></a>  skills/ai-handoff/scripts/ai_handoff.py <span class="dt">\</span></span>
+<span id="cb16-4"><a href="#cb16-4" aria-hidden="true" tabindex="-1"></a>  src/ai_handoff/handoff_impl.py <span class="dt">\</span></span>
+<span id="cb16-5"><a href="#cb16-5" aria-hidden="true" tabindex="-1"></a>  tests/test_ai_handoff.py</span></code></pre></div>
+<p>The implementation is intentionally duplicated in two places:</p>
+<ul>
+<li><code>skills/ai-handoff/scripts/ai_handoff.py</code></li>
+<li><code>src/ai_handoff/handoff_impl.py</code></li>
+</ul>
+<p>Keep them in sync when editing. The package entry point imports
+<code>src/ai_handoff/handoff_impl.py</code>; the Codex skill and
+<code>bin/ai-handoff</code> use the bundled skill script.</p>
+<p>Validate the installed skill when updating skill docs or scripts:</p>
+<div class="sourceCode" id="cb17"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb17-1"><a href="#cb17-1" aria-hidden="true" tabindex="-1"></a><span class="ex">python3</span> ~/.codex/skills/.system/skill-creator/scripts/quick_validate.py ~/.codex/skills/ai-handoff</span></code></pre></div>
+<h2 id="release-checklist">Release Checklist</h2>
+<p>Version <code>0.2.0</code> is declared in:</p>
+<ul>
+<li><code>pyproject.toml</code></li>
+<li><code>src/ai_handoff/__init__.py</code></li>
+<li><code>README.md</code></li>
+<li><code>README.html</code></li>
+<li>the CLI <code>--version</code> output</li>
+</ul>
+<p>Before tagging:</p>
+<div class="sourceCode" id="cb18"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb18-1"><a href="#cb18-1" aria-hidden="true" tabindex="-1"></a><span class="ex">python3</span> <span class="at">-m</span> unittest discover <span class="at">-s</span> tests</span>
+<span id="cb18-2"><a href="#cb18-2" aria-hidden="true" tabindex="-1"></a><span class="ex">pandoc</span> README.md <span class="at">-o</span> README.html <span class="at">--metadata</span> title=<span class="st">&#39;AI CLI Handoff&#39;</span></span>
+<span id="cb18-3"><a href="#cb18-3" aria-hidden="true" tabindex="-1"></a><span class="fu">git</span> status <span class="at">--short</span></span>
+<span id="cb18-4"><a href="#cb18-4" aria-hidden="true" tabindex="-1"></a><span class="fu">git</span> tag <span class="at">-a</span> v0.2.0 <span class="at">-m</span> <span class="st">&quot;ai-handoff 0.2.0&quot;</span></span>
+<span id="cb18-5"><a href="#cb18-5" aria-hidden="true" tabindex="-1"></a><span class="fu">git</span> push origin v0.2.0</span></code></pre></div>
+<p>Recommended order: merge the PR first, then tag the merge commit on
+<code>main</code>.</p>
+<h2 id="status">Status</h2>
+<p><code>0.2.0</code> improves source preference for Claude tooling
+carryover. The CLI now prefers formal plugin and skill sources over
+installed Claude cache copies, records evidence for the chosen source,
+and labels cache fallback clearly. <code>Claude Code -&gt; Codex</code>
+remains the first supported flow; the reverse
+<code>Codex -&gt; Claude Code</code> flow is intentionally visible in
+the wizard but not implemented yet.</p>
