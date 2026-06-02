@@ -39,7 +39,7 @@ That flow prepares a project for Codex by:
 - Selecting recent Claude Code conversations, defaulting to the latest three relevant sessions.
 - Letting you choose more conversations with a static checkbox picker.
 - Summarizing recent Claude work into Codex-readable context.
-- Converting durable `CLAUDE.md` project guidance into a managed `AGENTS.md` section.
+- Carrying `CLAUDE.md` guidance into a managed `AGENTS.md` section, including a first-run instruction for Codex to distill durable project rules.
 - Writing `.codex/handoff/summary.md`, `.codex/handoff/manifest.json`, and run snapshots.
 - Detecting MCPs, Claude skills, Claude plugins, hooks, rules, references, and statusline settings.
 - Scanning selected transcripts for tooling that was actually used, not just installed somewhere.
@@ -258,6 +258,9 @@ bin/ai-handoff show <run-id> --path /path/to/project
 
 - Codex reads this automatically as project instructions.
 - `ai-handoff` updates only the managed section between markers.
+- The managed section includes a first-run Codex distillation prompt plus a best-effort-redacted `CLAUDE.md` source snapshot.
+- The first ask tells Codex to read selected conversations, captured Claude setup, and the `CLAUDE.md` snapshot, then edit durable project context outside the managed markers.
+- That distillation should merge rules from `CLAUDE.md` and Claude permission settings while dropping stale, duplicated, or one-off handoff details.
 - Keep durable project rules outside the managed section.
 
 `.codex/handoff/summary.md`
