@@ -1132,6 +1132,48 @@ class AiHandoffTests(unittest.TestCase):
         self.assertIn("Use source instructions.", copied.read_text(encoding="utf-8"))
         self.assertNotIn("Use stale cache instructions.", copied.read_text(encoding="utf-8"))
 
+    @unittest.skipUnless(hasattr(os, "symlink"), "symlink support required")
+    def test_project_local_symlinked_skill_detects_npx_installer_origin(self) -> None:
+        skill_name = "remotion-best-practices"
+        project_skill_dir = self.project / ".agents" / "skills" / skill_name
+        project_skill_dir.mkdir(parents=True)
+        (project_skill_dir / "SKILL.md").write_text(
+            "---\nname: remotion-best-practices\ndescription: Remotion\n---\n\nUse Remotion rules.\n",
+            encoding="utf-8",
+        )
+        project_claude_skill = self.project / ".claude" / "skills" / skill_name
+        project_claude_skill.parent.mkdir(parents=True, exist_ok=True)
+        os.symlink(Path("../../.agents/skills") / skill_name, project_claude_skill)
+        settings_path = self.project / ".claude" / "settings.local.json"
+        settings = json.loads(settings_path.read_text(encoding="utf-8"))
+        settings["permissions"]["allow"].append(f"Bash(npx -y skills update {skill_name} -y)")
+        settings_path.write_text(json.dumps(settings), encoding="utf-8")
+
+        manifest = self.module.build_manifest(str(self.project), last=1)
+        skill = next(
+            item
+            for item in self.module.global_action_candidates(manifest)
+            if item["id"] == f"skill:{skill_name}"
+        )
+
+        self.assertEqual(skill["source_scope"], "project")
+        self.assertEqual(skill["skill_source_kind"], "project-local")
+        self.assertEqual(Path(skill["source_path"]).resolve(), project_skill_dir.resolve())
+        self.assertEqual(Path(skill["skill_link_path"]).resolve(), project_claude_skill.resolve())
+        self.assertEqual(skill["skill_origin_installer"], "npx-skills-cli")
+        self.assertEqual(skill["skill_origin_install_command"], f"npx -y skills update {skill_name} -y")
+        self.assertIn("npx-source", skill["risk_badges"])
+        self.assertIn("project-local", skill["risk_badges"])
+        self.assertIn("installer:", skill["evidence"])
+
+        manifest["selected_global_action_ids"] = [f"skill:{skill_name}"]
+        results = self.module.apply_selected_global_actions(manifest)
+
+        self.assertEqual(results[0]["status"], "ok")
+        self.assertEqual(results[0]["source_kind"], "project-local")
+        copied = self.home / ".codex" / "skills" / skill_name / "SKILL.md"
+        self.assertIn("Use Remotion rules.", copied.read_text(encoding="utf-8"))
+
     def test_skill_copy_materializes_github_source_before_cache_fallback(self) -> None:
         cache_skill = self.home / ".claude" / "skills" / "sample-skill" / "SKILL.md"
         cache_skill.write_text(

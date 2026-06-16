@@ -11,7 +11,7 @@ discovered MCP/skill/plugin usage. It then creates Codex-ready handoff
 artifacts such as <code>AGENTS.md</code> and
 <code>.codex/handoff/manifest.json</code>. Optional Codex user-level
 tooling carryover is reviewed separately and never runs by accident.</p>
-<p>Current version: <code>0.2.0</code></p>
+<p>Current version: <code>0.3.0</code></p>
 <h2 id="quick-start">Quick Start</h2>
 <p>From this repository:</p>
 <div class="sourceCode" id="cb1"><pre
@@ -26,7 +26,7 @@ class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="
 or install Codex-wide tooling until the final review step.</p>
 <h2 id="what-it-does">What It Does</h2>
 <p><code>ai-handoff</code> is built around handoff flows. In
-<code>0.2.0</code>, the implemented flow is
+<code>0.3.0</code>, the implemented flow is
 <code>Claude Code -&gt; Codex</code>.</p>
 <p>That flow prepares a project for Codex by:</p>
 <ul>
@@ -43,8 +43,8 @@ Codex to distill durable project rules.</li>
 when it needs deeper context.</li>
 <li>Writing <code>.codex/handoff/summary.md</code>,
 <code>.codex/handoff/manifest.json</code>, and run snapshots.</li>
-<li>Detecting MCPs, Claude skills, Claude plugins, hooks, rules,
-references, and statusline settings.</li>
+<li>Detecting MCPs, user-level and project-local Claude skills, Claude
+plugins, hooks, rules, references, and statusline settings.</li>
 <li>Scanning selected transcripts for tooling that was actually used,
 not just installed somewhere.</li>
 <li>Checking whether used Claude plugins already exist in Codex.</li>
@@ -181,6 +181,16 @@ secrets are skipped and reported as manual follow-up.</p>
 <p>Claude skills can be copied into <code>~/.codex/skills</code> when
 selected. Existing Codex skill destinations are skipped rather than
 overwritten.</p>
+<p>In <code>0.3.0</code>, skill discovery includes user-level
+<code>~/.claude/skills</code>, project-local
+<code>PROJECT/.claude/skills</code>, and project-local
+<code>PROJECT/.agents/skills</code>. Symlinked skill folders are
+resolved before copying so Codex receives the real skill content. If
+Claude settings record <code>npx skills add</code>,
+<code>npx skills install</code>, or <code>npx skills update</code> for a
+discovered skill, the candidate is labeled with <code>npx-source</code>
+and the command is kept as manual origin evidence;
+<code>ai-handoff</code> does not run <code>npx</code> automatically.</p>
 <h3 id="plugins">Plugins</h3>
 <p>Claude plugin records are not assumed to be Codex plugins. In
 <code>0.2.0</code>, <code>ai-handoff</code> uses this order:</p>
@@ -343,7 +353,7 @@ class="sourceCode bash"><code class="sourceCode bash"><span id="cb16-1"><a href=
 <div class="sourceCode" id="cb17"><pre
 class="sourceCode bash"><code class="sourceCode bash"><span id="cb17-1"><a href="#cb17-1" aria-hidden="true" tabindex="-1"></a><span class="ex">python3</span> ~/.codex/skills/.system/skill-creator/scripts/quick_validate.py ~/.codex/skills/ai-handoff</span></code></pre></div>
 <h2 id="release-checklist">Release Checklist</h2>
-<p>Version <code>0.2.0</code> is declared in:</p>
+<p>Version <code>0.3.0</code> is declared in:</p>
 <ul>
 <li><code>pyproject.toml</code></li>
 <li><code>src/ai_handoff/__init__.py</code></li>
@@ -356,15 +366,19 @@ class="sourceCode bash"><code class="sourceCode bash"><span id="cb17-1"><a href=
 class="sourceCode bash"><code class="sourceCode bash"><span id="cb18-1"><a href="#cb18-1" aria-hidden="true" tabindex="-1"></a><span class="ex">python3</span> <span class="at">-m</span> unittest discover <span class="at">-s</span> tests</span>
 <span id="cb18-2"><a href="#cb18-2" aria-hidden="true" tabindex="-1"></a><span class="ex">pandoc</span> README.md <span class="at">-o</span> README.html <span class="at">--metadata</span> title=<span class="st">&#39;AI CLI Handoff&#39;</span></span>
 <span id="cb18-3"><a href="#cb18-3" aria-hidden="true" tabindex="-1"></a><span class="fu">git</span> status <span class="at">--short</span></span>
-<span id="cb18-4"><a href="#cb18-4" aria-hidden="true" tabindex="-1"></a><span class="fu">git</span> tag <span class="at">-a</span> v0.2.0 <span class="at">-m</span> <span class="st">&quot;ai-handoff 0.2.0&quot;</span></span>
-<span id="cb18-5"><a href="#cb18-5" aria-hidden="true" tabindex="-1"></a><span class="fu">git</span> push origin v0.2.0</span></code></pre></div>
+<span id="cb18-4"><a href="#cb18-4" aria-hidden="true" tabindex="-1"></a><span class="fu">git</span> tag <span class="at">-a</span> v0.3.0 <span class="at">-m</span> <span class="st">&quot;ai-handoff 0.3.0&quot;</span></span>
+<span id="cb18-5"><a href="#cb18-5" aria-hidden="true" tabindex="-1"></a><span class="fu">git</span> push origin v0.3.0</span></code></pre></div>
 <p>Recommended order: merge the PR first, then tag the merge commit on
 <code>main</code>.</p>
 <h2 id="status">Status</h2>
-<p><code>0.2.0</code> improves source preference for Claude tooling
-carryover. The CLI now prefers formal plugin and skill sources over
-installed Claude cache copies, records evidence for the chosen source,
-and labels cache fallback clearly. <code>Claude Code -&gt; Codex</code>
-remains the first supported flow; the reverse
-<code>Codex -&gt; Claude Code</code> flow is intentionally visible in
-the wizard but not implemented yet.</p>
+<p><code>0.3.0</code> adds project-local skill discovery for
+<code>PROJECT/.claude/skills</code> and
+<code>PROJECT/.agents/skills</code>, resolves symlinked skill folders
+before Codex carryover, and records <code>npx skills</code> installer
+commands as origin evidence. <code>0.2.0</code> improved source
+preference for Claude tooling carryover by preferring formal plugin and
+skill sources over installed Claude cache copies, recording evidence for
+the chosen source, and labeling cache fallback clearly.
+<code>Claude Code -&gt; Codex</code> remains the first supported flow;
+the reverse <code>Codex -&gt; Claude Code</code> flow is intentionally
+visible in the wizard but not implemented yet.</p>

@@ -35,7 +35,7 @@ except Exception:  # pragma: no cover - Python < 3.11 fallback
     tomllib = None  # type: ignore[assignment]
 
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 MANAGED_START = "<!-- ai-handoff:start -->"
 MANAGED_END = "<!-- ai-handoff:end -->"
 DEFAULT_SELECTION = {
@@ -2670,7 +2670,14 @@ def resolve_local_source_path(value: str, base: Path) -> Optional[Path]:
     return candidate if (candidate / "SKILL.md").exists() else None
 
 
-def skill_source_metadata(cache_skill_dir: Path, text: str) -> Dict[str, Any]:
+def skill_source_metadata(
+    cache_skill_dir: Path,
+    text: str,
+    *,
+    default_source_kind: str = "claude-cache-fallback",
+    default_source_preference: str = "cache-fallback",
+    default_fallback_reason: str = "no formal skill source metadata found",
+) -> Dict[str, Any]:
     try:
         frontmatter, _body = parse_simple_frontmatter(text)
     except HandoffError:
@@ -2718,12 +2725,12 @@ def skill_source_metadata(cache_skill_dir: Path, text: str) -> Dict[str, Any]:
     if source_value:
         fallback_reason = f"formal skill source could not be resolved from {source_value}"
     else:
-        fallback_reason = "no formal skill source metadata found"
+        fallback_reason = default_fallback_reason
     return {
         "path": str(cache_skill_dir),
         "skill_cache_path": str(cache_skill_dir),
-        "skill_source_kind": "claude-cache-fallback",
-        "skill_source_preference": "cache-fallback",
+        "skill_source_kind": default_source_kind,
+        "skill_source_preference": default_source_preference,
         "skill_origin_source_path": "",
         "skill_origin_source_url": source_url,
         "skill_origin_github_repo": github_repo,
@@ -2734,20 +2741,145 @@ def skill_source_metadata(cache_skill_dir: Path, text: str) -> Dict[str, Any]:
     }
 
 
-def skill_names(skill_dir: Path) -> Dict[str, Dict[str, Any]]:
+def resolve_skill_directory(skill_dir: Path) -> Tuple[Path, str]:
+    if skill_dir.is_symlink():
+        try:
+            resolved = skill_dir.resolve(strict=True)
+        except OSError:
+            return skill_dir, ""
+        if (resolved / "SKILL.md").exists():
+            return resolved, str(skill_dir)
+    return skill_dir, ""
+
+
+def skill_names(
+    skill_dir: Path,
+    *,
+    default_source_kind: str = "claude-cache-fallback",
+    default_source_preference: str = "cache-fallback",
+    default_fallback_reason: str = "no formal skill source metadata found",
+) -> Dict[str, Dict[str, Any]]:
     result: Dict[str, Dict[str, Any]] = {}
     if not skill_dir.exists():
         return result
     for skill_md in skill_dir.glob("*/SKILL.md"):
+        source_dir, link_path = resolve_skill_directory(skill_md.parent)
+        source_skill_md = source_dir / "SKILL.md"
         text = read_text(skill_md, 4000) or ""
         name_match = re.search(r"(?m)^name:\s*([A-Za-z0-9_-]+)\s*$", text)
         name = name_match.group(1) if name_match else skill_md.parent.name
-        result[name] = {
+        metadata = skill_source_metadata(
+            source_dir,
+            text,
+            default_source_kind=default_source_kind,
+            default_source_preference=default_source_preference,
+            default_fallback_reason=default_fallback_reason,
+        )
+        entry = {
             "name": name,
-            "bytes": skill_md.stat().st_size,
-            **skill_source_metadata(skill_md.parent, text),
+            "bytes": source_skill_md.stat().st_size if source_skill_md.exists() else skill_md.stat().st_size,
+            **metadata,
         }
+        if link_path:
+            entry["skill_link_path"] = link_path
+        result[name] = entry
     return result
+
+
+def merge_skill_inventories(*inventories: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    merged: Dict[str, Dict[str, Any]] = {}
+    for inventory in inventories:
+        for name, info in inventory.items():
+            same_source = False
+            if name in merged and merged[name].get("path") and info.get("path"):
+                try:
+                    same_source = (
+                        Path(str(merged[name].get("path"))).expanduser().resolve()
+                        == Path(str(info.get("path"))).expanduser().resolve()
+                    )
+                except OSError:
+                    same_source = merged[name].get("path") == info.get("path")
+            if name in merged and same_source:
+                link_paths = [
+                    path
+                    for path in [
+                        merged[name].get("skill_link_path"),
+                        info.get("skill_link_path"),
+                    ]
+                    if path
+                ]
+                if link_paths:
+                    info = dict(info)
+                    info["skill_link_path"] = link_paths[0]
+            merged[name] = info
+    return merged
+
+
+def flatten_strings(value: Any) -> List[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list):
+        result: List[str] = []
+        for item in value:
+            result.extend(flatten_strings(item))
+        return result
+    if isinstance(value, dict):
+        result = []
+        for item in value.values():
+            result.extend(flatten_strings(item))
+        return result
+    return []
+
+
+def unwrap_bash_permission(value: str) -> str:
+    text = value.strip()
+    match = re.match(r"^Bash\((.*)\)$", text)
+    return match.group(1).strip() if match else text
+
+
+def npx_skill_installer_command(value: str) -> Optional[Tuple[str, str]]:
+    command = unwrap_bash_permission(value)
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        parts = command.split()
+    if not parts or parts[0] != "npx":
+        return None
+    index = 1
+    while index < len(parts) and parts[index].startswith("-"):
+        option = parts[index]
+        index += 1
+        if option in {"-p", "--package", "--cache", "--userconfig", "--registry"} and index < len(parts):
+            index += 1
+    if index >= len(parts) or parts[index] != "skills":
+        return None
+    if index + 2 >= len(parts) or parts[index + 1] not in {"add", "install", "update"}:
+        return None
+    skill_name = parts[index + 2]
+    if not re.match(r"^[A-Za-z0-9_.@-]+$", skill_name):
+        return None
+    return skill_name, command
+
+
+def skill_installer_commands_from_settings(data: Dict[str, Any]) -> Dict[str, List[str]]:
+    commands: Dict[str, List[str]] = {}
+    for value in flatten_strings(data):
+        parsed = npx_skill_installer_command(value)
+        if not parsed:
+            continue
+        name, command = parsed
+        commands.setdefault(name, [])
+        if command not in commands[name]:
+            commands[name].append(command)
+    return commands
+
+
+def merge_skill_installer_commands(target: Dict[str, List[str]], source: Dict[str, List[str]]) -> None:
+    for name, commands in source.items():
+        target.setdefault(name, [])
+        for command in commands:
+            if command not in target[name]:
+                target[name].append(command)
 
 
 def discover_claude_config(project: Path, codex: Dict[str, Any]) -> Dict[str, Any]:
@@ -2765,6 +2897,7 @@ def discover_claude_config(project: Path, codex: Dict[str, Any]) -> Dict[str, An
     claude_settings = []
     settings_files = []
     setup_capture = empty_setup_capture()
+    skill_installer_commands: Dict[str, List[str]] = {}
     for path, scope in claude_setting_paths(project):
         data = load_json(path)
         if isinstance(data, dict):
@@ -2773,11 +2906,32 @@ def discover_claude_config(project: Path, codex: Dict[str, Any]) -> Dict[str, An
             if scope == "project":
                 claude_settings.append(entry)
             add_settings_setup_captures(setup_capture, path, scope, data, project)
+            merge_skill_installer_commands(skill_installer_commands, skill_installer_commands_from_settings(data))
     add_project_reference_captures(setup_capture, project)
-    claude_skills = skill_names(home / ".claude" / "skills")
+    claude_skills = merge_skill_inventories(
+        skill_names(home / ".claude" / "skills"),
+        skill_names(
+            project / ".claude" / "skills",
+            default_source_kind="project-local",
+            default_source_preference="project-local",
+            default_fallback_reason="project-local Claude skill folder",
+        ),
+        skill_names(
+            project / ".agents" / "skills",
+            default_source_kind="project-local",
+            default_source_preference="project-local",
+            default_fallback_reason="project-local agent skill folder",
+        ),
+    )
     codex_skills = skill_names(home / ".codex" / "skills")
     skill_candidates = []
     for name, info in sorted(claude_skills.items()):
+        info = dict(info)
+        installer_commands = skill_installer_commands.get(name) or []
+        if installer_commands:
+            info["skill_origin_installer"] = "npx-skills-cli"
+            info["skill_origin_install_command"] = installer_commands[0]
+            info["skill_origin_install_commands"] = installer_commands
         skill_candidates.append(
             {
                 "name": name,
@@ -2919,6 +3073,8 @@ def candidate_scope_and_risk(action_type: str, item: Dict[str, Any], project: Pa
         has_local_path = "/Users/" in skill_text or str(home_dir()) in skill_text
         portable = ((skill_path / "SKILL.md").exists() or source_kind == "github-source") and not has_local_path
         source_scope = "project" if source_kind != "github-source" and source and path_is_within(skill_path, project) else "global"
+        origin_installer = str(item.get("skill_origin_installer") or "")
+        origin_install_command = str(item.get("skill_origin_install_command") or "")
         if source_kind == "source-repo":
             why_relevant = "Claude skill source metadata resolves to a formal source folder with SKILL.md."
             evidence = f"skill source repo: {skill_path}"
@@ -2927,12 +3083,18 @@ def candidate_scope_and_risk(action_type: str, item: Dict[str, Any], project: Pa
             evidence = f"GitHub skill source: {item.get('skill_origin_source_url') or item.get('path')}"
             requires_network = True
             risk_badges.extend(["network", "github-origin"])
+        elif source_kind == "project-local":
+            why_relevant = "Project-local Claude skill folder with SKILL.md."
+            evidence = f"project-local skill folder: {skill_path}"
         else:
             why_relevant = "Claude skill cache fallback with SKILL.md." if portable else "Claude skill cache fallback needs manual review."
             fallback_reason = str(item.get("skill_cache_fallback_reason") or "")
             evidence = f"Claude skill cache fallback: {skill_path}"
             if fallback_reason:
                 evidence = f"{evidence} ({fallback_reason})"
+        if origin_installer == "npx-skills-cli" and origin_install_command:
+            why_relevant = f"{why_relevant} Claude settings also record an npx skills installer command."
+            evidence = f"{evidence}; installer: {origin_install_command}"
         relevance_score = "high" if source_scope == "project" else "low"
         risk = "medium"
         if has_local_path:
@@ -2943,8 +3105,14 @@ def candidate_scope_and_risk(action_type: str, item: Dict[str, Any], project: Pa
                 risk_badges.append("git-source")
         elif source_kind == "github-source":
             risk_badges.extend(["source-repo", "git-source"])
+        elif source_kind == "project-local":
+            risk_badges.append("project-local")
         else:
             risk_badges.append("cache-fallback")
+        if origin_installer == "npx-skills-cli":
+            risk_badges.append("npx-source")
+            if origin_install_command:
+                manual_steps.append(f"optional: refresh upstream skill source with {origin_install_command}")
         manual_steps.append("review copied skill instructions before relying on them")
     elif action_type == "plugin":
         origin = plugin_origin_metadata(item)
@@ -4517,9 +4685,13 @@ def global_action_candidates(manifest: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "skill_origin_github_repo": item.get("skill_origin_github_repo", ""),
                 "skill_origin_ref": item.get("skill_origin_ref", ""),
                 "skill_origin_subdir": item.get("skill_origin_subdir", ""),
+                "skill_origin_installer": item.get("skill_origin_installer", ""),
+                "skill_origin_install_command": item.get("skill_origin_install_command", ""),
+                "skill_origin_install_commands": item.get("skill_origin_install_commands", []),
                 "skill_cache_path": item.get("skill_cache_path", ""),
                 "skill_cache_fallback_path": item.get("skill_cache_fallback_path", ""),
                 "skill_cache_fallback_reason": item.get("skill_cache_fallback_reason", ""),
+                "skill_link_path": item.get("skill_link_path", ""),
                 "destination_path": str(home_dir() / ".codex" / "skills" / name),
                 "hash": action_hash({"type": "skill", "name": name, "source_path": item.get("path")}),
                 "confidence": "medium",
@@ -4859,6 +5031,12 @@ def render_global_candidate_details(candidate: Dict[str, Any]) -> str:
             lines.append(f"Skill origin path: {candidate.get('skill_origin_source_path')}")
         if candidate.get("skill_origin_source_url"):
             lines.append(f"Skill origin URL: {candidate.get('skill_origin_source_url')}")
+        if candidate.get("skill_origin_installer"):
+            lines.append(f"Skill origin installer: {candidate.get('skill_origin_installer')}")
+        if candidate.get("skill_origin_install_command"):
+            lines.append(f"Skill origin command: {candidate.get('skill_origin_install_command')}")
+        if candidate.get("skill_link_path"):
+            lines.append(f"Skill link path: {candidate.get('skill_link_path')}")
         if candidate.get("skill_cache_fallback_path"):
             lines.append(f"Skill cache fallback: {candidate.get('skill_cache_fallback_path')}")
         if candidate.get("skill_cache_fallback_reason"):
